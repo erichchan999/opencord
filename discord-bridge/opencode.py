@@ -38,9 +38,11 @@ class OpenCode:
     async def __aexit__(self, *exc):
         await self._http.close()
 
-    async def request(self, method, path, *, directory=None, body=None, timeout=60):
+    async def request(self, method, path, *, directory=None, params=None, body=None, timeout=60):
         """Calls the API. `timeout` is a deadline in seconds for the whole call."""
-        params = {"directory": directory} if directory else None
+        params = dict(params or {})
+        if directory:
+            params["directory"] = directory
         try:
             async with self._http.request(
                 method,
@@ -79,6 +81,28 @@ class OpenCode:
 
     async def abort(self, session_id, directory):
         await self.request("POST", f"/session/{session_id}/abort", directory=directory, timeout=10)
+
+    async def providers(self, directory):
+        """Providers with their models. `connected` names the ones a prompt can use."""
+        return await self.request("GET", "/provider", directory=directory, timeout=10)
+
+    async def config(self, directory):
+        return await self.request("GET", "/config", directory=directory, timeout=10)
+
+    async def agents(self, directory):
+        return await self.request("GET", "/agent", directory=directory, timeout=10)
+
+    async def recent_messages(self, session_id, directory, limit):
+        """The session's last `limit` messages, oldest first."""
+        return await self.request(
+            "GET", f"/session/{session_id}/message", directory=directory, params={"limit": limit}, timeout=10
+        )
+
+    async def summarize(self, session_id, directory, model, timeout):
+        """Replaces the conversation so far with a summary. `model` is {"providerID", "modelID"}."""
+        await self.request(
+            "POST", f"/session/{session_id}/summarize", directory=directory, body=model, timeout=timeout
+        )
 
     async def prompt(self, session_id, directory, body, timeout):
         """Sends one prompt and waits for the agent's reply.

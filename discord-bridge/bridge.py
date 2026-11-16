@@ -10,6 +10,9 @@
 - "!stop" in a thread aborts the running request and drops that thread's
   queued ones. A request that runs longer than PROMPT_TIMEOUT_SECONDS (30 min)
   is aborted too, freeing its slot.
+- Slash commands (commands.py) choose a thread's model, thinking effort and
+  agent, and control its session. The bridge keeps those settings (state.py)
+  and sends them with every prompt.
 
 This container holds the Discord bot token. It never runs user commands; it
 only forwards text to the agent's HTTP API and posts the replies back.
@@ -18,7 +21,6 @@ only forwards text to the agent's HTTP API and posts the replies back.
 import asyncio
 import contextlib
 import itertools
-import json
 import logging
 import os
 import re
@@ -26,11 +28,14 @@ import signal
 import sys
 import time
 from collections import Counter
-from datetime import datetime, timezone
 
 import discord
+from discord import app_commands
 
+import commands
+from catalog import Catalog
 from opencode import OpenCode, OpenCodeError, PromptTimedOut
+from state import Store, set_setting, settings_of
 
 logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s", stream=sys.stdout)
 logging.getLogger("discord").setLevel(logging.WARNING)
@@ -53,65 +58,14 @@ STATE_FILE = os.environ.get("STATE_FILE", "/data/threads.json")
 BASE_DIR = os.environ.get("BASE_DIR", "/work/repo")
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "16"))
 PROMPT_TIMEOUT = float(os.environ.get("PROMPT_TIMEOUT_SECONDS", "1800"))
+# Longest wait for /compact, which is one model call over the whole conversation.
+COMPACT_TIMEOUT = 300
 DISCORD_LIMIT = 1900
 
 NO_MENTIONS = discord.AllowedMentions.none()
 agent = OpenCode(OPENCODE_URL, OPENCODE_PASSWORD)
-
-# ---------------------------------------------------------------- state
-#
-# threads.json maps a Discord thread ID to its session:
-#   {"threads": {"<thread id>": {"sessionId", "directory", "createdBy", "createdAt"}}}
-
-state = {"threads": {}}
-
-
-def set_aside_state_file(problem):
-    # Moved rather than left in place, where the next save would overwrite it,
-    # so the thread map can still be recovered by hand.
-    bad = f"{STATE_FILE}.bad-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
-    try:
-        os.replace(STATE_FILE, bad)
-        log.error("%s %s; moved it to %s and started with no threads", STATE_FILE, problem, bad)
-    except OSError as err:
-        log.error("%s %s, and could not move it aside: %s", STATE_FILE, problem, err)
-
-
-def load_state():
-    global state
-    loaded = None
-    try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            loaded = json.load(f)
-    except FileNotFoundError:
-        pass
-    except ValueError as err:  # includes undecodable bytes
-        set_aside_state_file(f"is not valid JSON ({err})")
-    except OSError as err:
-        log.error("could not read %s: %s", STATE_FILE, err)
-    threads = loaded.get("threads") if isinstance(loaded, dict) else None
-    if loaded not in (None, {}) and not isinstance(threads, dict):
-        set_aside_state_file("has no thread map")
-    if not isinstance(threads, dict):
-        threads = {}
-    state = {"threads": {key: entry for key, entry in threads.items() if isinstance(entry, dict)}}
-    # Threads from the per-thread-worktree layout move to the shared clone and
-    # get a fresh session on their next message.
-    for entry in state["threads"].values():
-        if entry.get("directory") != BASE_DIR:
-            entry.update(directory=BASE_DIR, sessionId=None, movedToSharedClone=True)
-
-
-def save_state():
-    # Synchronous on purpose: the file is tiny, and nothing else runs on the
-    # event loop while it is written, so saves never interleave.
-    tmp = f"{STATE_FILE}.tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
-        os.replace(tmp, STATE_FILE)
-    except OSError as err:
-        log.error("could not save state: %s", err)
+store = Store(STATE_FILE, BASE_DIR)  # thread -> session map and settings
+catalog = Catalog(agent, BASE_DIR)  # models, effort levels and agents the agent offers
 
 
 # ---------------------------------------------------------------- queueing
@@ -134,6 +88,10 @@ class ThreadQueue:
         task = asyncio.create_task(self._run(thread_id, lock, job, next(self._seq)))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+    def load(self, thread_id):
+        """How many of this thread's jobs are running or waiting."""
+        return self._pending[thread_id]
 
     def stop_point(self):
         """A marker for drop_waiting: jobs submitted before it can be dropped."""
@@ -265,14 +223,7 @@ def register_thread(thread, author):
     # Registered right away, before the request waits for a slot, so messages
     # posted in the thread meanwhile are queued behind it instead of ignored.
     # run_prompt creates the session when the first request runs.
-    entry = {
-        "sessionId": None,
-        "directory": BASE_DIR,
-        "createdBy": str(author.id),
-        "createdAt": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
-    }
-    state["threads"][str(thread.id)] = entry
-    save_state()
+    entry = store.register_thread(thread.id, author.id)
     log.info("thread %s opened by %s", thread.id, author.name)
     return entry
 
@@ -287,6 +238,38 @@ async def thread_parent_id(thread):
     return parent_id
 
 
+async def stop_thread(thread_id, entry, stop_point):
+    """Drops the thread's jobs submitted before stop_point and aborts the one running."""
+    queue.drop_waiting(thread_id, stop_point)
+    if entry.get("sessionId"):
+        with contextlib.suppress(Exception):
+            await agent.abort(entry["sessionId"], entry["directory"])
+
+
+async def prompt_settings(thread, entry):
+    """The model, variant and agent fields for this thread's next prompt.
+
+    A setting the agent no longer offers (opencode.json changed since it was
+    chosen) is removed from the thread, and the thread is told.
+    """
+    try:
+        snapshot = await catalog.get()
+    except Exception as err:
+        log.error("thread %s: could not read the model list, sending without settings: %s", thread.id, err)
+        return {}
+    options, dropped = snapshot.resolve(settings_of(entry))
+    if dropped:
+        for name in dropped:
+            set_setting(entry, name, None)
+        store.save()
+        await send(
+            thread,
+            f"The {' and '.join(dropped)} chosen for this thread {'is' if len(dropped) == 1 else 'are'} "
+            "no longer offered by the agent, so I went back to the default.",
+        )
+    return options
+
+
 async def run_prompt(thread, entry, message, text):
     started = time.monotonic()
     log.info("thread %s: prompt from %s (%d chars)", thread.id, message.author.name, len(text))
@@ -296,7 +279,7 @@ async def run_prompt(thread, entry, message, text):
             entry["sessionId"] = await agent.create_session(entry["directory"], session_title(thread))
             log.info("thread %s: session %s", thread.id, entry["sessionId"])
             moved = entry.pop("movedToSharedClone", False)
-            save_state()
+            store.save()
             if moved:
                 await send(
                     thread,
@@ -304,7 +287,23 @@ async def run_prompt(thread, entry, message, text):
                     "Earlier context from this thread is not carried over.",
                 )
 
-        body = {"parts": [{"type": "text", "text": f"Discord user {message.author.display_name} says:\n\n{text}"}]}
+        options = await prompt_settings(thread, entry)
+        model = options.get("model")
+        log.info(
+            "thread %s: model %s, effort %s, agent %s",
+            thread.id,
+            f"{model['providerID']}/{model['modelID']}" if model else "default",
+            options.get("variant", "default"),
+            options.get("agent", "default"),
+        )
+        body = {
+            "parts": [{"type": "text", "text": f"Discord user {message.author.display_name} says:\n\n{text}"}],
+            # The agent's question tool waits for an answer, and the bridge has
+            # no way to give one yet, so a question would hold the request
+            # until it times out. Off until the bridge can show questions.
+            "tools": {"question": False},
+            **options,
+        }
         try:
             try:
                 result = await agent.prompt(entry["sessionId"], entry["directory"], body, PROMPT_TIMEOUT)
@@ -313,7 +312,7 @@ async def run_prompt(thread, entry, message, text):
                     raise
                 # Session disappeared (e.g. agent data volume was reset): start a new one.
                 entry["sessionId"] = await agent.create_session(entry["directory"], session_title(thread))
-                save_state()
+                store.save()
                 await send(thread, "My earlier context for this thread was lost, so I started a fresh session.")
                 result = await agent.prompt(entry["sessionId"], entry["directory"], body, PROMPT_TIMEOUT)
         except PromptTimedOut as err:
@@ -343,7 +342,9 @@ async def run_prompt(thread, entry, message, text):
         )
         if reply:
             await send_long(thread, reply)
-        if error:
+        if error and error.get("name") == "MessageAbortedError":
+            pass  # someone stopped it, and "!stop" or the command has already answered them
+        elif error:
             await send(thread, f"The agent stopped with an error: {str(detail)[:500]}")
         elif not reply:
             await send(thread, "Done. (The agent finished without a text reply.)")
@@ -367,6 +368,25 @@ intents.guild_messages = True
 intents.message_content = True
 client = discord.Client(intents=intents, allowed_mentions=NO_MENTIONS)
 
+# Slash commands arrive over the same gateway connection as messages.
+tree = app_commands.CommandTree(client)
+commands.setup(
+    tree,
+    commands.Context(
+        store=store,
+        agent=agent,
+        catalog=catalog,
+        queue=queue,
+        channel_id=CHANNEL_ID,
+        compact_timeout=COMPACT_TIMEOUT,
+        thread_parent_id=thread_parent_id,
+        stop_thread=stop_thread,
+        send=send,
+        report_failure=report_failure,
+        keep_typing=keep_typing,
+    ),
+)
+
 
 # Messages people write. System messages (thread renames, pins, joins) are
 # ignored, since some carry text that would otherwise be sent as a prompt.
@@ -387,7 +407,7 @@ async def on_message(message):
     # The parent lookup can wait on Discord, so nothing is queued after it:
     # follow-ups check it inside their queued job, and "!stop" takes its stop
     # point first. Either way the thread's messages keep their order.
-    entry = state["threads"].get(str(channel.id))
+    entry = store.threads.get(str(channel.id))
     if entry is not None:
         text = clean_content(message, bot_id)
         if not text:
@@ -396,10 +416,7 @@ async def on_message(message):
             stop_point = queue.stop_point()
             if await thread_parent_id(channel) != CHANNEL_ID:
                 return
-            queue.drop_waiting(channel.id, stop_point)
-            if entry.get("sessionId"):
-                with contextlib.suppress(Exception):
-                    await agent.abort(entry["sessionId"], entry["directory"])
+            await stop_thread(channel.id, entry, stop_point)
             with contextlib.suppress(discord.HTTPException):
                 await message.add_reaction("🛑")
             return
@@ -468,10 +485,25 @@ async def on_ready():
         log.info("watching #%s%s", channel.name, f"; MISSING permissions: {', '.join(missing)}" if missing else "")
     except Exception as err:
         log.error("cannot access channel %s: %s", CHANNEL_ID, err)
+        return
+    # Registered to this one server, where they show up at once. Commands
+    # registered globally can take an hour to appear.
+    try:
+        tree.copy_global_to(guild=channel.guild)
+        synced = await tree.sync(guild=channel.guild)
+        log.info("slash commands ready: %s", " ".join(f"/{command.name}" for command in synced))
+    except discord.Forbidden as err:
+        log.error(
+            "could not register slash commands: %s. Re-invite the bot with the applications.commands scope "
+            "(see the README).",
+            err,
+        )
+    except discord.HTTPException as err:
+        log.error("could not register slash commands: %s", err)
 
 
 async def main():
-    load_state()
+    store.load()
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -480,6 +512,16 @@ async def main():
     async with agent, client:
         await agent.wait_until_ready()
         log.info("opencode-agent is reachable")
+        try:
+            snapshot = await catalog.get()
+            log.info(
+                "agent offers models %s (default %s) and agents %s",
+                ", ".join(snapshot.models) or "none",
+                snapshot.default_model,
+                ", ".join(snapshot.agents) or "none",
+            )
+        except Exception as err:  # retried on first use
+            log.error("could not read the agent's model list yet: %s", err)
         bot = asyncio.create_task(client.start(TOKEN))
         stopping = asyncio.create_task(stop.wait())
         done, _ = await asyncio.wait({bot, stopping}, return_when=asyncio.FIRST_COMPLETED)

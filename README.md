@@ -1,6 +1,6 @@
 # fx-never-sleeps Discord sandbox
 
-Discord users @mention a bot in one channel. Each request gets its own Discord thread and its own OpenCode session, running on DeepSeek. Up to 16 sessions run in parallel. They all work in one shared clone of the repo. The agent can read and change the `fx-never-sleeps` repo, run shell commands, use the open web, and open PRs.
+Discord users @mention a bot in one channel. Each request gets its own Discord thread and its own OpenCode session, running on DeepSeek. Up to 16 sessions run in parallel. They all work in one shared clone of the repo. The agent can read and change the `fx-never-sleeps` repo, run shell commands, use the open web, and open PRs. Slash commands choose each thread's model, thinking effort and agent.
 
 Everything runs as Docker containers on Docker Desktop, in the `fx-sandbox` compose project, so you can watch them, their logs and their resource use in the Docker Desktop dashboard. Nothing from Windows is mounted into them.
 
@@ -18,7 +18,7 @@ Each container's secrets come from its own file in `secrets/`, so no container g
 | --- | --- |
 | `compose.yaml` | The three containers, their networks and resource limits |
 | `start.ps1` | Deploy, status (including which commit is deployed), logs and stop |
-| `discord-bridge/` | `bridge.py` (Discord side) and `opencode.py` (OpenCode API client). Python 3.13, discord.py and aiohttp. |
+| `discord-bridge/` | `bridge.py` (messages and threads), `commands.py` (slash commands), `state.py` (thread map and settings), `catalog.py` (the models and agents the agent offers) and `opencode.py` (OpenCode API client). Python 3.13, discord.py and aiohttp. |
 | `llm-proxy/server.py` | The proxy that holds the DeepSeek key. Python standard library only. |
 | `opencode-agent/` | Agent image, egress firewall, startup scripts, OpenCode config. Node, because OpenCode is installed from npm. |
 | `secrets.example/` | One env file per container with placeholders. Real values go in `secrets/`, which git ignores. |
@@ -74,6 +74,8 @@ In Docker Desktop's settings, keep "Expose daemon on tcp://localhost:2375 withou
    - Add Reactions (for the `!stop` reaction)
    - Attach Files
 
+   The `bot` scope also covers the slash commands. The bridge registers them with your server each time it starts and logs `slash commands ready: ...`.
+
    To get the channel ID, turn on Developer Mode in Discord, right-click the channel and choose Copy Channel ID.
 
 6. **Start it:**
@@ -109,12 +111,46 @@ Each deploy stamps every container with an `fx.revision` label: the commit this 
 - **Idle threads:** a thread uses a slot only while the agent is answering it. Old threads cost a few KB of session history on disk, and any new message in one resumes its session.
 - **Replies:** the bot never pings anyone, whatever the agent writes.
 
+### Slash commands
+
+Anyone who can post in the channel can use them. A change is announced in the thread. Lookups are shown only to the person who asked.
+
+| Command | In a thread | In the main channel |
+| --- | --- | --- |
+| `/model` | Choose the thread's model | Choose the model new threads start on |
+| `/effort` | Choose how hard the model thinks: `off`, `low`, `high` or `max` | The same, for new threads |
+| `/agent` | Switch between OpenCode agents. `plan` reads and proposes without editing files; `build` is the default. | The same, for new threads |
+| `/status` | Show the model, effort, agent, whether a request is running, and how full the context is | Show the defaults and how many threads are working |
+| `/stop` | Same as `!stop` | |
+| `/new` | Start a fresh session in the same thread. Settings stay, earlier context is dropped. | |
+| `/compact` | Replace the conversation so far with a summary, to free up context | |
+| `/help` | List the commands | List the commands |
+
+Typing `default` as the value puts a setting back on the agent's own config. A change made while a request is running applies from the next message.
+
+Settings are stored per thread, next to the thread map on the `bridge-data` volume, and are sent to the agent with every message. A thread keeps them when its session is lost or replaced with `/new`. A new thread copies the main channel's defaults when it is opened, so changing the defaults later leaves existing threads alone.
+
 ## Models
 
-The default is `deepseek-flash`. `deepseek-v4-pro` is also configured. Change `model` in `opencode-agent/opencode.json` and redeploy.
+The models, the default and the effort levels all come from `opencode-agent/opencode.json`. The slash commands read them from the agent, so after you edit that file and redeploy, `/model` and `/effort` offer the new list.
+
+- `model` is what a thread uses until someone runs `/model`. It is `deepseek-flash`; `deepseek-v4-pro` is also configured.
+- Each model's `variants` are its effort levels. `low`, `high` and `max` send DeepSeek's `reasoning_effort`, and `off` turns thinking off. With no level chosen, nothing is sent and DeepSeek uses its own default, which is thinking on at `high`.
+
+## Tests
+
+The bridge's settings, model list and slash command logic have unit tests. They run inside a Docker build, so nothing needs installing on Windows:
+
+```powershell
+docker build --target test --progress plain -t fx-sandbox-bridge-test discord-bridge
+```
+
+The build fails if a test fails. The tests use stand-ins for Discord and the agent, so they do not cover the live connection to either.
 
 ## Not done yet
 
+- Questions from the agent. OpenCode's `question` tool is switched off on every request, because the bridge has no way to show a question or send back the answer, and an unanswered one would hold the request until it timed out.
+- Live progress in the thread (tool calls, todo list) while a request runs
 - A system prompt for the branch-and-PR workflow
 - Tighter access control (a role or a user allowlist)
 - Scheduled resets of the agent container and its volumes
