@@ -3,12 +3,12 @@ FROM node:22-trixie-slim
 ARG OPENCODE_VERSION=1.19.5
 
 # Tools the agent (and channel users, through it) can use.
-# iptables + util-linux (setpriv) are only used by the root entrypoint.
+# iptables, iproute2 and util-linux (setpriv) are only needed by the root entrypoint.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl git gh jq less procps ripgrep unzip \
       python3 python3-pip python3-venv \
-      iptables util-linux \
+      iptables iproute2 util-linux \
  && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g "opencode-ai@${OPENCODE_VERSION}" && npm cache clean --force

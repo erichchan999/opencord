@@ -3,10 +3,13 @@
 - @mention the bot in DISCORD_CHANNEL_ID -> it opens a thread with its own
   OpenCode session and answers there. Every session works in the shared clone
   (BASE_DIR); the agent can make branches or worktrees itself if asked.
-- Any later message in that thread continues the same session.
+- Any later message in that thread continues the same session. Only threads
+  under DISCORD_CHANNEL_ID count, so threads left in a previously configured
+  channel are ignored.
 - Threads run in parallel, up to MAX_CONCURRENT at once.
-- "!stop" in a thread aborts the running request. A request that runs longer
-  than PROMPT_TIMEOUT_SECONDS (30 min) is aborted too, freeing its slot.
+- "!stop" in a thread aborts the running request and drops that thread's
+  queued ones. A request that runs longer than PROMPT_TIMEOUT_SECONDS (30 min)
+  is aborted too, freeing its slot.
 
 This container holds the Discord bot token. It never runs user commands; it
 only forwards text to the agent's HTTP API and posts the replies back.
@@ -14,6 +17,7 @@ only forwards text to the agent's HTTP API and posts the replies back.
 
 import asyncio
 import contextlib
+import itertools
 import json
 import logging
 import os
@@ -62,18 +66,37 @@ agent = OpenCode(OPENCODE_URL, OPENCODE_PASSWORD)
 state = {"threads": {}}
 
 
+def set_aside_state_file(problem):
+    # Moved rather than left in place, where the next save would overwrite it,
+    # so the thread map can still be recovered by hand.
+    bad = f"{STATE_FILE}.bad-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
+    try:
+        os.replace(STATE_FILE, bad)
+        log.error("%s %s; moved it to %s and started with no threads", STATE_FILE, problem, bad)
+    except OSError as err:
+        log.error("%s %s, and could not move it aside: %s", STATE_FILE, problem, err)
+
+
 def load_state():
     global state
+    loaded = None
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
-            state = {**state, **json.load(f)}
+            loaded = json.load(f)
     except FileNotFoundError:
         pass
-    except (OSError, ValueError) as err:
+    except ValueError as err:  # includes undecodable bytes
+        set_aside_state_file(f"is not valid JSON ({err})")
+    except OSError as err:
         log.error("could not read %s: %s", STATE_FILE, err)
+    threads = loaded.get("threads") if isinstance(loaded, dict) else None
+    if loaded not in (None, {}) and not isinstance(threads, dict):
+        set_aside_state_file("has no thread map")
+    if not isinstance(threads, dict):
+        threads = {}
+    state = {"threads": {key: entry for key, entry in threads.items() if isinstance(entry, dict)}}
     # Threads from the per-thread-worktree layout move to the shared clone and
     # get a fresh session on their next message.
-    state.pop("adminSessionId", None)
     for entry in state["threads"].values():
         if entry.get("directory") != BASE_DIR:
             entry.update(directory=BASE_DIR, sessionId=None, movedToSharedClone=True)
@@ -101,19 +124,33 @@ class ThreadQueue:
         self._slots = asyncio.Semaphore(limit)
         self._locks = {}
         self._pending = Counter()
+        self._dropped_before = {}  # thread id -> jobs submitted before this number are skipped
+        self._seq = itertools.count()
         self._tasks = set()  # asyncio only keeps weak references to tasks
 
     def submit(self, thread_id, job):
         lock = self._locks.setdefault(thread_id, asyncio.Lock())
         self._pending[thread_id] += 1
-        task = asyncio.create_task(self._run(thread_id, lock, job))
+        task = asyncio.create_task(self._run(thread_id, lock, job, next(self._seq)))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    async def _run(self, thread_id, lock, job):
+    def stop_point(self):
+        """A marker for drop_waiting: jobs submitted before it can be dropped."""
+        return next(self._seq)
+
+    def drop_waiting(self, thread_id, stop_point):
+        """Skips this thread's jobs that were submitted before stop_point and haven't started."""
+        if self._pending[thread_id]:
+            self._dropped_before[thread_id] = max(stop_point, self._dropped_before.get(thread_id, -1))
+
+    async def _run(self, thread_id, lock, job, seq):
         try:
-            async with lock, self._slots:
-                await job()
+            async with lock:
+                if seq < self._dropped_before.get(thread_id, -1):
+                    return
+                async with self._slots:
+                    await job()
         except Exception:
             log.exception("thread %s", thread_id)
         finally:
@@ -121,6 +158,7 @@ class ThreadQueue:
             if not self._pending[thread_id]:
                 del self._pending[thread_id]
                 self._locks.pop(thread_id, None)
+                self._dropped_before.pop(thread_id, None)
 
 
 queue = ThreadQueue(MAX_CONCURRENT)
@@ -142,15 +180,20 @@ def split_for_discord(text):
         current = "```\n" if in_fence else ""
 
     for line in text.split("\n"):
+        # Checked before a long line is cut, so its tail can't hide the fence.
+        fence = line.lstrip().startswith("```")
         while len(line) > DISCORD_LIMIT:
             push()
             current += line[:DISCORD_LIMIT]
             line = line[DISCORD_LIMIT:]
+            if fence:
+                in_fence = not in_fence
+                fence = False
             push()
         if len(current) + len(line) + 1 > DISCORD_LIMIT:
             push()
         current += line if not current or current.endswith("\n") else "\n" + line
-        if line.lstrip().startswith("```"):
+        if fence:
             in_fence = not in_fence
     if current.strip():
         chunks.append(current)
@@ -166,8 +209,22 @@ async def send_long(channel, text):
         await send(channel, chunk)
 
 
+def bot_role(message):
+    """The bot's own managed role, which Discord's autocomplete often offers instead of the bot."""
+    return message.guild.self_role if message.guild else None
+
+
+def mentions_bot(message, bot_id):
+    role = bot_role(message)
+    return any(user.id == bot_id for user in message.mentions) or (role is not None and role in message.role_mentions)
+
+
 def clean_content(message, bot_id):
-    text = re.sub(rf"<@!?{bot_id}>", "", message.content).strip()
+    role = bot_role(message)
+    text = re.sub(rf"<@!?{bot_id}>", "", message.content)
+    if role is not None:
+        text = text.replace(f"<@&{role.id}>", "")
+    text = text.strip()
     files = [f"{a.filename}: {a.url}" for a in message.attachments]
     if files:
         text += "\n\n(Attached files, fetch them if needed:\n" + "\n".join(files) + ")"
@@ -204,18 +261,30 @@ async def keep_typing(channel):
 # ---------------------------------------------------------------- handlers
 
 
-async def setup_thread(thread, author):
-    session_id = await agent.create_session(BASE_DIR, session_title(thread))
+def register_thread(thread, author):
+    # Registered right away, before the request waits for a slot, so messages
+    # posted in the thread meanwhile are queued behind it instead of ignored.
+    # run_prompt creates the session when the first request runs.
     entry = {
-        "sessionId": session_id,
+        "sessionId": None,
         "directory": BASE_DIR,
         "createdBy": str(author.id),
         "createdAt": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
     }
     state["threads"][str(thread.id)] = entry
     save_state()
-    log.info("thread %s opened by %s, session %s", thread.id, author.name, session_id)
+    log.info("thread %s opened by %s", thread.id, author.name)
     return entry
+
+
+async def thread_parent_id(thread):
+    # A thread missing from discord.py's cache arrives as a PartialMessageable
+    # with no parent, so ask Discord. None (unknown) counts as not ours.
+    parent_id = getattr(thread, "parent_id", None)
+    if parent_id is None:
+        with contextlib.suppress(discord.HTTPException):
+            parent_id = getattr(await client.fetch_channel(thread.id), "parent_id", None)
+    return parent_id
 
 
 async def run_prompt(thread, entry, message, text):
@@ -225,6 +294,7 @@ async def run_prompt(thread, entry, message, text):
     try:
         if not entry.get("sessionId"):
             entry["sessionId"] = await agent.create_session(entry["directory"], session_title(thread))
+            log.info("thread %s: session %s", thread.id, entry["sessionId"])
             moved = entry.pop("movedToSharedClone", False)
             save_state()
             if moved:
@@ -298,21 +368,35 @@ intents.message_content = True
 client = discord.Client(intents=intents, allowed_mentions=NO_MENTIONS)
 
 
+# Messages people write. System messages (thread renames, pins, joins) are
+# ignored, since some carry text that would otherwise be sent as a prompt.
+USER_MESSAGE_TYPES = (discord.MessageType.default, discord.MessageType.reply)
+
+
 @client.event
 async def on_message(message):
-    if message.author.bot or client.user is None:
+    if message.author.bot or client.user is None or message.type not in USER_MESSAGE_TYPES:
         return
     bot_id = client.user.id
     channel = message.channel
 
     # Follow-ups inside a thread this bridge owns. Looked up by ID rather than
     # channel type, so a thread missing from discord.py's cache still works.
+    # Only threads under the watched channel count, so threads left over from a
+    # previously configured channel stop forwarding messages.
+    # The parent lookup can wait on Discord, so nothing is queued after it:
+    # follow-ups check it inside their queued job, and "!stop" takes its stop
+    # point first. Either way the thread's messages keep their order.
     entry = state["threads"].get(str(channel.id))
     if entry is not None:
         text = clean_content(message, bot_id)
         if not text:
             return
         if text == "!stop":
+            stop_point = queue.stop_point()
+            if await thread_parent_id(channel) != CHANNEL_ID:
+                return
+            queue.drop_waiting(channel.id, stop_point)
             if entry.get("sessionId"):
                 with contextlib.suppress(Exception):
                     await agent.abort(entry["sessionId"], entry["directory"])
@@ -321,6 +405,8 @@ async def on_message(message):
             return
 
         async def follow_up():
+            if await thread_parent_id(channel) != CHANNEL_ID:
+                return
             try:
                 await run_prompt(channel, entry, message, text)
             except Exception as err:
@@ -330,7 +416,7 @@ async def on_message(message):
         return
 
     # New requests: @mention in the one allowed channel.
-    if channel.id != CHANNEL_ID or not any(user.id == bot_id for user in message.mentions):
+    if channel.id != CHANNEL_ID or not mentions_bot(message, bot_id):
         return
     text = clean_content(message, bot_id)
     if not text:
@@ -345,9 +431,10 @@ async def on_message(message):
         await report_failure(channel, f'could not start a thread (does the bot have "Create Public Threads"?): {err}')
         return
 
+    entry = register_thread(thread, message.author)
+
     async def new_request():
         try:
-            entry = await setup_thread(thread, message.author)
             await run_prompt(thread, entry, message, text)
         except Exception as err:
             await report_failure(thread, err)
@@ -374,6 +461,8 @@ async def on_ready():
             "read_message_history",
             "create_public_threads",
             "send_messages_in_threads",
+            "add_reactions",
+            "attach_files",
         ]
         missing = [name for name in needed if not getattr(perms, name)]
         log.info("watching #%s%s", channel.name, f"; MISSING permissions: {', '.join(missing)}" if missing else "")

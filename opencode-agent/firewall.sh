@@ -7,7 +7,8 @@
 # loopback-style range is rejected, which covers the Windows host and WSL
 # (including its DNS relay), the Docker gateways, your home LAN,
 # and the other containers. The only private destinations allowed are the
-# ones listed in ALLOW_INTERNAL (host:port pairs), i.e. the llm-proxy.
+# ones listed in ALLOW_INTERNAL (host:port pairs), i.e. the llm-proxy, on
+# that port across the internal network it shares with the agent.
 set -eu
 
 ALLOW_INTERNAL="${ALLOW_INTERNAL:-llm-proxy:8080}"
@@ -27,6 +28,17 @@ if [ -z "$IPT" ]; then
 fi
 IP6T="$(echo "$IPT" | sed 's/^iptables/ip6tables/')"
 
+# in_subnet 172.20.0.5 172.20.0.3/16 -> true when the address is inside the subnet.
+in_subnet() {
+  echo "$1 $2" | awk '{
+    split($1, a, "."); split($2, c, "/"); split(c[1], b, ".")
+    size = 2 ^ (32 - c[2])
+    ip = ((a[1] * 256 + a[2]) * 256 + a[3]) * 256 + a[4]
+    net = ((b[1] * 256 + b[2]) * 256 + b[3]) * 256 + b[4]
+    exit !(int(ip / size) == int(net / size))
+  }'
+}
+
 $IPT -w -F OUTPUT
 $IPT -w -P OUTPUT ACCEPT
 $IPT -w -A OUTPUT -o lo -j ACCEPT
@@ -41,9 +53,25 @@ for entry in $ALLOW_INTERNAL; do
     echo "firewall: cannot resolve $host; refusing to start" >&2
     exit 1
   fi
+  # Allow the whole network the host sits on rather than its current address,
+  # so the host stays reachable when its container is recreated with a new IP.
+  # The host must be inside a subnet attached to this container: anything
+  # reached through a gateway or tunnel would open the port more widely.
   for ip in $ips; do
-    $IPT -w -A OUTPUT -d "$ip" -p tcp --dport "$port" -j ACCEPT
-    echo "firewall: allow $host ($ip) tcp/$port"
+    dev="$(ip -4 route get "$ip" | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}')"
+    net=""
+    for cidr in $(ip -4 -o addr show dev "$dev" | awk '{print $4}'); do
+      if in_subnet "$ip" "$cidr"; then
+        net="$cidr"
+        break
+      fi
+    done
+    if [ -z "$net" ]; then
+      echo "firewall: $host ($ip) is not on a network attached to this container; refusing to start" >&2
+      exit 1
+    fi
+    $IPT -w -A OUTPUT -d "$net" -p tcp --dport "$port" -j ACCEPT
+    echo "firewall: allow $host's network ($net) tcp/$port"
   done
 done
 

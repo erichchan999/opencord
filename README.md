@@ -26,7 +26,7 @@ Each container's secrets come from its own file in `secrets/`, so no container g
 ### Isolation
 
 - **Windows:** nothing is mounted. The `fx-sandbox` distro has `automount` and `interop` turned off in `/etc/wsl.conf`.
-- **Network:** the agent's firewall is set up as root at startup, before it drops to the `node` user with no capabilities. It blocks every private range, which covers the Windows host, your LAN and the other containers. The only private address it allows is the proxy on port 8080. The open internet is allowed.
+- **Network:** the agent's firewall is set up as root at startup, before it drops to the `node` user with no capabilities. It blocks every private range, which covers the Windows host, your LAN and the other containers. The only private destination it allows is port 8080 on the internal network shared with the proxy, so a recreated proxy with a new IP stays reachable. The open internet is allowed.
 - **Internal networks:** `bridge-net` (bridge ↔ agent) and `llm-net` (agent ↔ proxy) have no route outside.
 - **Limits:** CPU, memory and process limits on every container. `no-new-privileges` is set and all capabilities are dropped.
 
@@ -116,9 +116,9 @@ After editing any file here, run `.\start.ps1` again to redeploy.
 
 - **New request:** @mention the bot in the channel. It opens a thread with a new OpenCode session working in `/work/repo`.
 - **Branches:** the bridge doesn't create branches or worktrees. Ask the agent for one if a change needs it.
-- **Follow-ups:** any message in that thread continues the same session.
+- **Follow-ups:** any message in that thread continues the same session. Only threads under `DISCORD_CHANNEL_ID` count: if you move the bot to another channel, its old threads stop responding.
 - **Parallel threads:** up to `MAX_CONCURRENT` (16) threads run at once, and further requests wait in a queue. All sessions share one checkout, so two threads editing the same files at the same time can collide.
-- **Cancel:** `!stop` in the thread aborts the current request.
+- **Cancel:** `!stop` in the thread aborts the current request and drops any of that thread's messages still waiting in the queue.
 - **Time limit:** a request that runs longer than 30 minutes is stopped, and the thread is told. Set `PROMPT_TIMEOUT_SECONDS` in `secrets/bridge.env` to change it.
 - **Idle threads:** a thread uses a slot only while the agent is answering it. Old threads cost a few KB of session history on disk, and any new message in one resumes its session.
 - **Replies:** the bot never pings anyone, whatever the agent writes.
