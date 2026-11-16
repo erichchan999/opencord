@@ -1,0 +1,3 @@
+# Real keys and tokens. Placeholders live in secrets.example/.
+secrets/
+__pycache__/
