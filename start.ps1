@@ -1,38 +1,55 @@
-# fx-never-sleeps Discord sandbox - runs in the locked-down "fx-sandbox" WSL distro.
+# fx-never-sleeps Discord sandbox - runs on Docker Desktop.
 #
-#   .\start.ps1           copy this folder into the distro, build, and (re)start everything
-#   .\start.ps1 -Status   show container status
+#   .\start.ps1           build and (re)start everything from this folder
+#   .\start.ps1 -Status   show container status and which commit each one runs
 #   .\start.ps1 -Logs     follow the logs (Ctrl+C to stop following)
 #   .\start.ps1 -Stop     stop the containers (volumes and the repo clone are kept)
 #
-# The distro has no access to C:, so this script copies the project in with tar.
+# Docker Desktop's dashboard shows the same containers under the "fx-sandbox"
+# project, with their logs, stats and an "fx.revision" label naming the commit.
 param([switch]$Status, [switch]$Logs, [switch]$Stop)
 
-# Native tools (wsl, docker) write progress to stderr; Windows PowerShell 5.1
+# Native tools (docker, git) write progress to stderr; Windows PowerShell 5.1
 # would turn that into errors under 'Stop'. Exit codes are checked instead.
 $ErrorActionPreference = 'Continue'
-$distro = 'fx-sandbox'
-$remote = '/opt/fx-sandbox'
 $here = $PSScriptRoot
 
 # A plain function on purpose: with a param() block PowerShell would bind
 # "-d" to its own -Debug switch instead of passing it to docker compose.
 function Invoke-Compose {
-    & wsl.exe -d $distro -u root --cd $remote -- docker compose @args
+    & docker compose --project-directory $here -f (Join-Path $here 'compose.yaml') @args
     if ($LASTEXITCODE -ne 0) { throw "docker compose $($args -join ' ') failed" }
 }
 
-function Start-KeepAlive {
-    # WSL stops an idle distro (and its containers) when no Windows-launched
-    # process is using it. A hidden "sleep infinity" keeps it running.
-    $running = Get-CimInstance Win32_Process -Filter "Name = 'wsl.exe'" |
-        Where-Object { $_.CommandLine -like "*-d $distro*sleep infinity*" }
-    if (-not $running) {
-        Start-Process -FilePath wsl.exe -ArgumentList @('-d', $distro, '-u', 'root', '--cd', '/', '--', 'sleep', 'infinity') -WindowStyle Hidden
-    }
+# The commit this folder is at, with "-dirty" if it has uncommitted changes.
+function Get-Revision {
+    $rev = & git -C $here rev-parse --short HEAD 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $rev) { return 'unknown' }
+    if (& git -C $here status --porcelain 2>$null) { $rev += '-dirty' }
+    return $rev
 }
 
-if ($Status) { Invoke-Compose ps; exit }
+& docker info --format '{{.ServerVersion}}' *> $null
+if ($LASTEXITCODE -ne 0) { throw 'Docker Desktop is not running. Start it and try again.' }
+
+if ($Status) {
+    $ids = Invoke-Compose ps -a -q
+    if (-not $ids) { Write-Host 'No containers. Run .\start.ps1 to deploy.'; exit }
+    $local = Get-Revision
+    $containers = & docker inspect $ids | Out-String | ConvertFrom-Json
+    $containers | ForEach-Object {
+        $deployed = $_.Config.Labels.'fx.revision'
+        [pscustomobject]@{
+            Service  = $_.Config.Labels.'com.docker.compose.service'
+            State    = if ($_.State.Health) { "$($_.State.Status) ($($_.State.Health.Status))" } else { $_.State.Status }
+            Since    = ([datetime]$_.State.StartedAt).ToLocalTime().ToString('yyyy-MM-dd HH:mm')
+            Revision = $deployed
+            UpToDate = $deployed -eq $local -and $local -notlike '*-dirty' -and $local -ne 'unknown'
+        }
+    } | Sort-Object Service | Format-Table -AutoSize
+    Write-Host "Local folder is at $local."
+    exit
+}
 if ($Logs) { Invoke-Compose logs -f --tail 100; exit }
 if ($Stop) { Invoke-Compose stop; exit }
 
@@ -54,15 +71,9 @@ foreach ($file in $required.Keys) {
     }
 }
 
-Write-Host "Copying project into $distro`:$remote ..."
-& wsl.exe -d $distro -u root --cd / -- mkdir -p $remote
-& wsl.exe -d $distro -u root --cd / -- find $remote -mindepth 1 -delete
-# cmd.exe pipes raw bytes; Windows PowerShell 5.1 would corrupt the tar stream.
-cmd.exe /c "tar -cf - --exclude=.git --exclude=__pycache__ -C `"$here`" . | wsl.exe -d $distro -u root --cd / -- tar -xf - -C $remote"
-if ($LASTEXITCODE -ne 0) { throw 'Copying the project into the distro failed.' }
-& wsl.exe -d $distro -u root --cd / -- chmod 700 "$remote/secrets"
-
-Start-KeepAlive
-Write-Host 'Building and starting containers ...'
+# compose.yaml puts this on every container as the "fx.revision" label. A new
+# value recreates the containers, so the label always names what is running.
+$env:FX_REVISION = Get-Revision
+Write-Host "Building and starting containers at $env:FX_REVISION ..."
 Invoke-Compose up -d --build --remove-orphans
 Invoke-Compose ps

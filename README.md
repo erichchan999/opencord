@@ -2,7 +2,7 @@
 
 Discord users @mention a bot in one channel. Each request gets its own Discord thread and its own OpenCode session, running on DeepSeek. Up to 16 sessions run in parallel. They all work in one shared clone of the repo. The agent can read and change the `fx-never-sleeps` repo, run shell commands, use the open web, and open PRs.
 
-Everything runs in Docker inside a dedicated WSL distro, `fx-sandbox`. That distro can't see your Windows drives or launch Windows programs.
+Everything runs as Docker containers on Docker Desktop, in the `fx-sandbox` compose project, so you can watch them, their logs and their resource use in the Docker Desktop dashboard. Nothing from Windows is mounted into them.
 
 ## Layout
 
@@ -17,7 +17,7 @@ Each container's secrets come from its own file in `secrets/`, so no container g
 | Path | What it is |
 | --- | --- |
 | `compose.yaml` | The three containers, their networks and resource limits |
-| `start.ps1` | Deploy, status, logs and stop, run from Windows |
+| `start.ps1` | Deploy, status (including which commit is deployed), logs and stop |
 | `discord-bridge/` | `bridge.py` (Discord side) and `opencode.py` (OpenCode API client). Python 3.13, discord.py and aiohttp. |
 | `llm-proxy/server.py` | The proxy that holds the DeepSeek key. Python standard library only. |
 | `opencode-agent/` | Agent image, egress firewall, startup scripts, OpenCode config. Node, because OpenCode is installed from npm. |
@@ -25,36 +25,18 @@ Each container's secrets come from its own file in `secrets/`, so no container g
 
 ### Isolation
 
-- **Windows:** nothing is mounted. The `fx-sandbox` distro has `automount` and `interop` turned off in `/etc/wsl.conf`.
+- **Windows:** no Windows folder is mounted into any container. The images are built from this folder, but only the files each Dockerfile copies end up inside.
 - **Network:** the agent's firewall is set up as root at startup, before it drops to the `node` user with no capabilities. It blocks every private range, which covers the Windows host, your LAN and the other containers. The only private destination it allows is port 8080 on the internal network shared with the proxy, so a recreated proxy with a new IP stays reachable. The open internet is allowed.
 - **Internal networks:** `bridge-net` (bridge ↔ agent) and `llm-net` (agent ↔ proxy) have no route outside.
 - **Limits:** CPU, memory and process limits on every container. `no-new-privileges` is set and all capabilities are dropped.
 
-The remaining risk is a Linux kernel exploit. All WSL distros share one VM kernel, including any other distro you use that does mount `C:`.
+The remaining risk is a container escape or a Linux kernel exploit. Docker Desktop's VM can reach your Windows files (it shares them for bind mounts), and all WSL distros share one VM kernel, so an escape could reach `C:`.
+
+In Docker Desktop's settings, keep "Expose daemon on tcp://localhost:2375 without TLS" turned off.
 
 ## Setup
 
-1. **Create the distro** (once). In PowerShell:
-
-   ```powershell
-   wsl --install Ubuntu-24.04 --name fx-sandbox --no-launch
-   wsl -d fx-sandbox -u root
-   ```
-
-   Inside the distro, install Docker Engine from Docker's apt repository, then lock the distro down:
-
-   ```bash
-   apt-get update && apt-get install -y ca-certificates curl
-   install -m 0755 -d /etc/apt/keyrings
-   curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-   chmod a+r /etc/apt/keyrings/docker.asc
-   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list
-   apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-   printf '[boot]\nsystemd=true\n\n[automount]\nenabled=false\nmountFsTab=false\n\n[interop]\nenabled=false\nappendWindowsPath=false\n\n[user]\ndefault=root\n' > /etc/wsl.conf
-   exit
-   ```
-
-   Then restart it so the new `wsl.conf` applies: `wsl --terminate fx-sandbox`.
+1. **Docker Desktop:** install it with the WSL 2 backend. In Settings → General, turn on "Start Docker Desktop when you sign in", so the bot comes back after a reboot (the containers restart on their own once Docker is up).
 
 2. **Secrets:** copy the examples, then fill in each file.
 
@@ -100,17 +82,21 @@ The remaining risk is a Linux kernel exploit. All WSL distros share one VM kerne
    .\start.ps1
    ```
 
-   This copies the folder into the distro (it can't read `C:`), builds the images and starts the containers. It also starts a hidden `wsl.exe ... sleep infinity` so WSL doesn't shut the distro down when idle. The bridge log should end with `watching #<channel>`, and it names any missing permissions.
+   This builds the images from this folder and starts the containers. The bridge log should end with `watching #<channel>`, and it names any missing permissions.
 
 Other commands:
 
 ```powershell
-.\start.ps1 -Status   # container status
+.\start.ps1 -Status   # container status, and which commit each container runs
 .\start.ps1 -Logs     # follow logs
 .\start.ps1 -Stop     # stop containers (repo clone, sessions and thread map are kept)
 ```
 
 After editing any file here, run `.\start.ps1` again to redeploy.
+
+### Which version is running
+
+Each deploy stamps every container with an `fx.revision` label: the commit this folder was at, plus `-dirty` if it had uncommitted changes. `.\start.ps1 -Status` shows it next to the folder's current commit, with an `UpToDate` column. In Docker Desktop, open a container and look under its labels.
 
 ## Using it
 

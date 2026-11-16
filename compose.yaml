@@ -11,6 +11,10 @@
 name: fx-sandbox
 
 x-hardening: &hardening
+  # The commit start.ps1 deployed, shown by `.\start.ps1 -Status` and in
+  # Docker Desktop. "-dirty" means it had uncommitted changes.
+  labels:
+    fx.revision: "${FX_REVISION:-unknown}"
   cap_drop: [ALL]
   security_opt: ["no-new-privileges:true"]
   restart: unless-stopped
@@ -43,7 +47,7 @@ services:
     cap_add: [NET_ADMIN, NET_RAW, SETUID, SETGID, SETPCAP]
     sysctls:
       net.ipv6.conf.all.disable_ipv6: "1"
-    # Public resolvers: the WSL/Docker default upstream DNS sits in a private
+    # Public resolvers: Docker Desktop's default upstream DNS sits in a private
     # range, which the egress firewall blocks.
     dns: [1.1.1.1, 9.9.9.9]
     networks:
