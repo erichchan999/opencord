@@ -180,7 +180,7 @@ def test_a_resumed_turn_counts_the_time_before_the_restart():
 
 def test_tool_detail_picks_the_telling_input():
     assert tool_detail("bash", {"input": {"command": "npm test\n  --watch=false"}}) == "npm test --watch=false"
-    assert tool_detail("read", {"input": {"filePath": "/work/repo/a.py"}}) == "/work/repo/a.py"
+    assert tool_detail("read", {"input": {"filePath": "/work/sandbox/a.py"}}) == "/work/sandbox/a.py"
     assert tool_detail("task", {"input": {"description": "Run echo", "prompt": "long"}}) == "Run echo"
     assert tool_detail("bash", {"input": {}}) == ""
     assert tool_detail("mystery", {"input": {"x": 1}, "title": "Did a thing"}) == "Did a thing"

@@ -202,6 +202,17 @@ def test_a_session_the_agent_forgot_is_replaced(world):
     assert world.thread.texts()[-1] == "done." and bridge.router.turns == {}
 
 
+def test_a_thread_moved_to_the_sandbox_says_so_on_its_next_message(world):
+    session = play(world, "tools")
+    world.entry["movedFolder"] = True  # set by Store.load for a thread from the old repo clone
+    asyncio.run(bridge.run_turn(world.thread, world.entry, AUTHOR, "hello again"))
+    assert world.entry["sessionId"] == session and "movedFolder" not in world.entry
+    assert world.thread.texts()[0].startswith("This thread now works in the shared sandbox, so I started a fresh session.")
+
+    asyncio.run(bridge.run_turn(world.thread, world.entry, AUTHOR, "and again"))
+    assert sum("shared sandbox" in text for text in world.thread.texts()) == 1
+
+
 def test_a_request_that_runs_too_long_is_stopped(world, monkeypatch):
     monkeypatch.setattr(bridge, "PROMPT_TIMEOUT", 0)
     session = world.agent.session_id
@@ -313,10 +324,12 @@ def test_after_a_restart_a_question_shown_while_checking_is_waited_on_once(world
     asyncio.run(run())
 
 
-def test_a_note_without_a_session_is_just_dropped(world):
+def test_a_note_without_a_session_is_dropped_and_its_status_ended(world):
+    # As left by Store.load for a thread that moved folder while a request ran.
     world.entry["turn"] = {"statusMessageId": 4242, "startedAt": time.time(), "label": ""}
     asyncio.run(bridge.resume_turn(str(THREAD), world.entry))
-    assert "turn" not in world.entry and world.thread.sent == [] and world.thread.edits == []
+    assert "turn" not in world.entry and world.thread.sent == [] and world.agent.prompts == []
+    assert world.thread.edits == [(4242, "-# ⏹️ Interrupted by a restart. The next message starts a fresh session.", "unchanged")]
 
 
 def test_stopping_a_thread_marks_the_request_and_dismisses_its_questions(world):
@@ -659,7 +672,7 @@ def test_files_go_out_with_the_prompt(world):
         {
             "type": "text",
             "text": "Discord user Erich says:\n\n(No message, only the attached files.)\n\n"
-            "(Attached to this message, with their content included here: a.txt. They are not in the checkout.)",
+            "(Attached to this message, with their content included here: a.txt. They are not in the sandbox.)",
         },
         part,
     ]

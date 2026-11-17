@@ -3,7 +3,7 @@
 #   .\start.ps1           build and (re)start everything from this folder
 #   .\start.ps1 -Status   show container status and which commit each one runs
 #   .\start.ps1 -Logs     follow the logs (Ctrl+C to stop following)
-#   .\start.ps1 -Stop     stop the containers (volumes and the repo clone are kept)
+#   .\start.ps1 -Stop     stop the containers (volumes and the sandbox are kept)
 #
 # start.sh does the same on macOS and Linux.
 # Docker Desktop's dashboard shows the same containers under the "opencord"
@@ -57,7 +57,6 @@ if ($Stop) { Invoke-Compose stop; exit }
 # Check secrets before deploying.
 $required = @{
     'secrets\proxy.env'  = @('DEEPSEEK_API_KEY')
-    'secrets\agent.env'  = @('REPO', 'GH_TOKEN')
     'secrets\bridge.env' = @('DISCORD_BOT_TOKEN')
     'secrets\shared.env' = @('OPENCODE_SERVER_PASSWORD')
 }

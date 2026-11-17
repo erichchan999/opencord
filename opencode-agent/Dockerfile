@@ -7,7 +7,7 @@ ARG OPENCODE_VERSION=1.19.5
 # iptables, iproute2 and util-linux (setpriv) are only needed by the root entrypoint.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates curl git gh jq less procps ripgrep unzip \
+      ca-certificates curl git jq less procps ripgrep unzip \
       python3 python3-pip python3-venv \
       iptables iproute2 util-linux \
  && rm -rf /var/lib/apt/lists/*

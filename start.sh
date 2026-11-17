@@ -4,7 +4,7 @@
 #   ./start.sh            build and (re)start everything from this folder
 #   ./start.sh --status   show container status and which commit each one runs
 #   ./start.sh --logs     follow the logs (Ctrl+C to stop following)
-#   ./start.sh --stop     stop the containers (volumes and the repo clone are kept)
+#   ./start.sh --stop     stop the containers (volumes and the sandbox are kept)
 #
 # start.ps1 does the same on Windows. Docker Desktop's dashboard shows the
 # same containers under the "opencord" project, with an "opencord.revision"
@@ -89,7 +89,6 @@ check() {
     done
 }
 check secrets/proxy.env DEEPSEEK_API_KEY
-check secrets/agent.env REPO GH_TOKEN
 check secrets/bridge.env DISCORD_BOT_TOKEN
 check secrets/shared.env OPENCODE_SERVER_PASSWORD
 

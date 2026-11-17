@@ -42,7 +42,6 @@ class Agent:
         self.summarized = []
         self.history = []  # the session's messages
         self.info = {"id": "ses_1", "title": "Discord: Fix the login bug"}  # GET /session/{id}
-        self.changes = {}  # request message id -> file changes
         self.calls = []
         self.shell_answer = None
         self.shell_fails = None
@@ -59,8 +58,6 @@ class Agent:
     async def summarize(self, session_id, directory, model, timeout):
         self.summarized.append((session_id, model))
 
-    async def diff(self, session_id, directory, message_id):
-        return self.changes.get(message_id, [])
 
     async def revert(self, session_id, directory, message_id):
         self.calls.append(("revert", session_id, message_id))
@@ -97,7 +94,7 @@ class Catalog:
 
 class Harness:
     def __init__(self, tmp_path):
-        self.store = Store(str(tmp_path / "threads.json"), "/work/repo")
+        self.store = Store(str(tmp_path / "threads.json"), "/work/sandbox")
         self.store.load()
         self.entry = self.store.register_thread(THREAD, 42)
         self.thread = Channel(THREAD, "Fix the login bug")
@@ -175,7 +172,7 @@ class Harness:
         return [(c.name, c.value) for c in asyncio.run(handler(Interaction(channel_id), typed))]
 
     def saved(self):
-        again = Store(self.store.path, "/work/repo")
+        again = Store(self.store.path, "/work/sandbox")
         again.load()
         return again
 
@@ -472,6 +469,7 @@ def test_help_is_private_fits_one_message_and_names_every_command(tmp_path):
     assert private and len(text) <= 2000
     for command in h.tree.get_commands():
         assert command.name == "help" or f"`/{command.name}`" in text
+    assert "shell command in the sandbox" in text and "files stay as they are" in text and "checkout" not in text
 
 
 def test_format_tokens():
@@ -529,7 +527,7 @@ def test_rename_renames_the_thread_and_its_session(tmp_path):
 # ---------------------------------------------------------------- undo and redo
 
 
-def test_undo_asks_first_and_names_the_files(tmp_path):
+def test_undo_asks_first_and_says_files_stay(tmp_path):
     h = Harness(tmp_path)
     assert "nothing to undo yet" in only_reply(h.run("undo"))[0]
 
@@ -542,37 +540,35 @@ def test_undo_asks_first_and_names_the_files(tmp_path):
     assert h.run("undo").followup.sent == [("There is nothing left to undo in this session.", True)]
 
     h.agent.history = [request("msg_1", "first"), reply("msg_2"), request("msg_3", "add **logging**"), reply("msg_4", "done")]
-    h.agent.changes = {"msg_3": [{"file": "app.py"}, {"file": "log.py"}]}
     interaction = h.run("undo")
     ((text, private),) = interaction.followup.sent
-    assert private and text.startswith("Undo the last request, “add \\*\\*logging\\*\\*” from Tester?")
-    assert "`app.py`, `log.py`" in text and "same checkout" in text and "`/redo`" in text
+    assert private and text == (
+        "Undo the last request, “add \\*\\*logging\\*\\*” from Tester?\n"
+        "It comes out of the conversation, so the agent forgets it. Files in the sandbox stay as they are.\n"
+        "`/redo` brings it back, until the next message is sent in this thread."
+    )
     view = interaction.followup.views[0]
     assert [item.custom_id for item in view.children] == ["c:undo:msg_3", "c:cancel"] and view.is_finished()
     assert h.agent.calls == [] and h.queue.jobs == []  # nothing happens before the click
-
-    h.agent.changes = {}
-    assert "changed no files" in h.run("undo").followup.sent[0][0]
 
 
 def test_undo_happens_on_the_click(tmp_path):
     h = Harness(tmp_path)
     h.entry["sessionId"] = "ses_1"
     h.agent.history = [request("msg_1", "first"), reply("msg_2"), request("msg_3", "second"), reply("msg_4")]
-    h.agent.changes = {"msg_3": [{"file": "app.py"}]}
     interaction = h.click("c:undo:msg_3")
     assert interaction.response.edited == [("Undoing…", None)]
     h.queue.run_all()
     assert h.agent.calls == [("revert", "ses_1", "msg_3")]
     assert h.posted == [
-        "↩️ **Tester** undid the last request, “second”. Files put back: `app.py`. "
+        "↩️ **Tester** undid the last request, “second”. Files in the sandbox stay as they are. "
         "`/redo` brings it back until the next message is sent."
     ]
 
     # Undo again: the request before the one already taken back.
     h.click("c:undo:msg_1")
     h.queue.run_all()
-    assert h.agent.calls[-1] == ("revert", "ses_1", "msg_1") and "“first”. It had changed no files." in h.posted[-1]
+    assert h.agent.calls[-1] == ("revert", "ses_1", "msg_1") and "“first”." in h.posted[-1]
 
 
 def test_an_undo_click_after_the_thread_moved_on_does_nothing(tmp_path):
@@ -610,7 +606,7 @@ def test_redo_brings_back_what_undo_took(tmp_path):
     assert interaction.response.deferred is False and h.agent.calls == []  # queued
     h.queue.run_all()
     assert h.agent.calls == [("unrevert", "ses_1")]
-    assert interaction.followup.sent == [("↪️ **Tester** brought back 2 requests taken back with `/undo`, file changes included.", False)]
+    assert interaction.followup.sent == [("↪️ **Tester** brought back 2 requests taken back with `/undo`.", False)]
 
 
 def test_a_late_redo_answer_goes_to_the_thread(tmp_path):
@@ -621,7 +617,7 @@ def test_a_late_redo_answer_goes_to_the_thread(tmp_path):
     interaction = h.run("redo")
     interaction.followup.fail = True  # the interaction expired while the redo waited
     h.queue.run_all()
-    assert h.posted == ["↪️ **Tester** brought back 1 request taken back with `/undo`, file changes included."]
+    assert h.posted == ["↪️ **Tester** brought back 1 request taken back with `/undo`."]
 
 
 # ---------------------------------------------------------------- fork
@@ -642,6 +638,7 @@ def test_fork_opens_a_thread_with_a_copy_of_the_session(tmp_path):
     assert copy["sessionId"] == "ses_fork" and copy["model"] == PRO and copy["agent"] == "plan" and "effort" not in copy
     assert ("rename", "ses_fork", "Discord: Fix the login bug (fork)") in h.agent.calls
     assert h.posted_to[0][0] == 700 and f"carries on from <#{THREAD}>" in h.posted_to[0][1]
+    assert "both work in the same sandbox" in h.posted_to[0][1]
     assert h.posted_to[1] == (THREAD, "🍴 Forked into <#700>.")
 
 

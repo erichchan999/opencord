@@ -2,8 +2,7 @@
 
 - @mention the bot in an enabled channel -> it opens
   a thread with its own OpenCode session and answers there. Every session
-  works in the shared clone (BASE_DIR); the agent can make branches or
-  worktrees itself if asked.
+  works in the same sandbox folder (BASE_DIR), which is not a git repo.
 - Any later message in that thread continues the same session, for as long
   as the thread's parent channel stays enabled.
 - Threads run in parallel, up to MAX_CONCURRENT at once.
@@ -84,7 +83,7 @@ TOKEN = env("DISCORD_BOT_TOKEN")
 OPENCODE_URL = env("OPENCODE_URL", "http://opencode-agent:4096")
 OPENCODE_PASSWORD = env("OPENCODE_SERVER_PASSWORD")
 STATE_FILE = os.environ.get("STATE_FILE", "/data/threads.json")
-BASE_DIR = os.environ.get("BASE_DIR", "/work/repo")
+BASE_DIR = os.environ.get("BASE_DIR", "/work/sandbox")
 CHANNEL_IDS = set(map(str.strip, os.environ.get("DISCORD_CHANNEL_IDS", "").split(","))) - {""}
 MAX_CONCURRENT = number("MAX_CONCURRENT", 16, int)
 # Longest a request may work, not counting time spent waiting for a person to
@@ -500,12 +499,12 @@ async def ensure_session(thread, entry):
     if not entry.get("sessionId"):
         entry["sessionId"] = await agent.create_session(entry["directory"], session_title(thread))
         log.info("thread %s: session %s", thread.id, entry["sessionId"])
-        moved = entry.pop("movedToSharedClone", False)
+        moved = entry.pop("movedFolder", False)
         store.save()
         if moved:
             await send(
                 thread,
-                "This thread now works in the shared checkout, so I started a fresh session. "
+                "This thread now works in the shared sandbox, so I started a fresh session. "
                 "Earlier context from this thread is not carried over.",
             )
     return entry["sessionId"]
@@ -547,10 +546,10 @@ async def run_turn(thread, entry, author, text, files=()):
     log.info("thread %s: using %s", thread.id, label or "the agent's defaults")
     says = text or "(No message, only the attached files.)"
     if files:
-        # Without this the agent looks for the files in the checkout, fails to
+        # Without this the agent looks for the files in the sandbox, fails to
         # find them, and distrusts the content it was given.
         names = ", ".join(part["filename"] for part in files)
-        says += f"\n\n(Attached to this message, with their content included here: {names}. They are not in the checkout.)"
+        says += f"\n\n(Attached to this message, with their content included here: {names}. They are not in the sandbox.)"
     body = {
         "parts": [{"type": "text", "text": f"Discord user {author.display_name} says:\n\n{says}"}, *files],
         # The agent may ask questions: they are answered from Discord. Sent
@@ -632,8 +631,14 @@ async def resume_turn(thread_id, entry):
     info = entry.get("turn") or {}
     session_id = entry.get("sessionId")
     if not session_id:
+        # Its session was dropped meanwhile, as when the thread moved folder:
+        # there is nothing to follow, so the status message says it ended.
         entry.pop("turn", None)
         store.save()
+        if info.get("statusMessageId"):
+            await StatusMessage(channel_for(thread_id), info["statusMessageId"]).show(
+                "-# ⏹️ Interrupted by a restart. The next message starts a fresh session."
+            )
         return
     started_at = info.get("startedAt") or time.time()
     # Registered before asking the agent, so the end of the work is not missed in between.
@@ -765,7 +770,7 @@ async def finish_turn(thread, entry, turn, status, outcome, call=None):
 
     if reply:
         await send_long(thread, reply)
-    carry_on = "Anything it changed so far is still in the checkout. Send another message to carry on."
+    carry_on = "Anything it changed so far is still in the sandbox. Send another message to carry on."
     if result == "timeout" and halted:
         await send(thread, f"I stopped this request because it ran for more than {minutes} minutes. {carry_on}")
     elif result == "silent" and halted:

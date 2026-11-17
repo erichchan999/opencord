@@ -139,19 +139,11 @@ class OpenCode:
     async def rename(self, session_id, directory, title):
         await self.request("PATCH", f"/session/{session_id}", directory=directory, body={"title": title}, timeout=10)
 
-    async def diff(self, session_id, directory, message_id):
-        """The files one request changed, each {"file", "status", "additions", "deletions", "patch"}.
-
-        `message_id` is the request's user message. Without one the server returns nothing.
-        """
-        return await self.request(
-            "GET", f"/session/{session_id}/diff", directory=directory, params={"messageID": message_id}, timeout=30
-        ) or []
-
     async def revert(self, session_id, directory, message_id):
-        """Takes back a request and everything after it: out of the context, and its file changes undone.
+        """Takes back a request and everything after it, out of the context.
 
-        The server accepts any message id without complaint, so pass one that exists.
+        File changes are undone only in a git repo, where OpenCode keeps
+        snapshots. The sandbox is not one. The server accepts any message id without complaint, so pass one that exists.
         """
         return await self.request(
             "POST", f"/session/{session_id}/revert", directory=directory, body={"messageID": message_id}, timeout=60

@@ -55,7 +55,7 @@ class Agent:
 
 class Harness:
     def __init__(self, tmp_path):
-        self.store = Store(str(tmp_path / "threads.json"), "/work/repo")
+        self.store = Store(str(tmp_path / "threads.json"), "/work/sandbox")
         self.store.load()
         self.store.register_thread(THREAD, 42)["sessionId"] = SESSION
         self.agent = Agent()
@@ -70,7 +70,7 @@ class Harness:
             return self.channel if self.enabled else None
 
         self.questions = Questions(
-            self.store, self.agent, "/work/repo",
+            self.store, self.agent, "/work/sandbox",
             channel_for=lambda thread_id: self.channel,
             home_of=home_of,
             thread_for_session=thread_for_session,
@@ -85,7 +85,7 @@ class Harness:
         return interaction
 
     def saved(self):
-        again = Store(self.store.path, "/work/repo")
+        again = Store(self.store.path, "/work/sandbox")
         again.load()
         return again
 

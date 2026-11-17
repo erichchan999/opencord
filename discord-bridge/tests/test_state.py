@@ -2,7 +2,7 @@ import json
 
 from state import Store, set_setting, settings_of
 
-BASE = "/work/repo"
+BASE = "/work/sandbox"
 
 
 def write(path, data):
@@ -51,12 +51,22 @@ def test_new_thread_copies_the_defaults_and_then_stands_alone(tmp_path):
     assert entry["sessionId"] is None and entry["directory"] == BASE and entry["createdBy"] == "42"
 
 
-def test_thread_from_another_directory_moves_to_the_shared_clone(tmp_path):
+def test_threads_from_another_directory_move_to_the_sandbox(tmp_path):
     path = tmp_path / "threads.json"
-    write(path, {"threads": {"100": {"sessionId": "ses_1", "directory": "/work/trees/100", "model": "a/b"}}})
-    entry = load(path).threads["100"]
-    assert entry["directory"] == BASE and entry["sessionId"] is None and entry["movedToSharedClone"] is True
-    assert entry["model"] == "a/b"
+    threads = {
+        "100": {"sessionId": "ses_1", "directory": "/work/repo", "model": "a/b"},
+        # Moved from a worktree to the repo clone, with no message since.
+        "101": {"sessionId": None, "directory": "/work/repo", "movedToSharedClone": True},
+        "102": {"sessionId": "ses_2", "directory": BASE},
+    }
+    write(path, {"threads": threads})
+    loaded = load(path).threads
+    for key in ("100", "101"):
+        entry = loaded[key]
+        assert entry["directory"] == BASE and entry["sessionId"] is None and entry["movedFolder"] is True
+        assert "movedToSharedClone" not in entry
+    assert loaded["100"]["model"] == "a/b"
+    assert loaded["102"] == {"sessionId": "ses_2", "directory": BASE}
 
 
 def test_invalid_json_is_set_aside_not_overwritten(tmp_path):

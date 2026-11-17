@@ -170,12 +170,6 @@ def asked(message):
     return None, text
 
 
-def file_names(changes, limit=10):
-    names = [f"`{plain(change.get('file') or '?', 80)}`" for change in changes[:limit]]
-    more = f" and {len(changes) - limit} more" if len(changes) > limit else ""
-    return ", ".join(names) + more
-
-
 def shell_result(message):
     """(output, error) of a /shell run, from the message the agent stored for it."""
     for part in (message or {}).get("parts") or []:
@@ -203,19 +197,19 @@ def shell_message(output, limit=MESSAGE_LIMIT - 100):
     return f"```\n…\n{tail}\n```\n-# The end of the output. All of it is attached.", output
 
 
-def undo_question(target, changes):
+# Said by /undo: OpenCode only snapshots files in a git repo, and the sandbox is not one.
+FILES_STAY = "Files in the sandbox stay as they are."
+
+
+def undo_question(target):
     who, text = asked(target)
-    lines = [f"Undo the last request, “{snippet(text)}”{' from ' + discord.utils.escape_markdown(who) if who else ''}?"]
-    if changes:
-        lines.append(f"These files go back to how they were before it: {file_names(changes)}.")
-        lines.append(
-            "⚠️ Every thread works in the same checkout. If another thread changed these files since, "
-            "those changes are lost too."
-        )
-    else:
-        lines.append("It changed no files, so only the conversation is taken back.")
-    lines.append("`/redo` brings it back, until the next message is sent in this thread.")
-    return "\n".join(lines)
+    return "\n".join(
+        [
+            f"Undo the last request, “{snippet(text)}”{' from ' + discord.utils.escape_markdown(who) if who else ''}?",
+            f"It comes out of the conversation, so the agent forgets it. {FILES_STAY}",
+            "`/redo` brings it back, until the next message is sent in this thread.",
+        ]
+    )
 
 
 def confirm_view(message_id):
@@ -489,13 +483,13 @@ def setup(tree, ctx):
             "`/status` the thread's settings and how full its context is\n"
             "**The session**\n"
             "`/stop` stop the current request and drop waiting ones (`!stop` does the same)\n"
-            "`/undo` take back the last request and its file changes, `/redo` bring it back\n"
+            "`/undo` take the last request out of the conversation (files stay as they are), `/redo` bring it back\n"
             "`/clear` clear the context and start over in the same thread\n"
             "`/compact` replace the conversation so far with a summary to free up context\n"
             "`/fork` open a new thread that carries on from here\n"
             "`/rename` rename the thread and its session\n"
             "**Running**\n"
-            "`/shell` run a shell command in the checkout. The agent sees the output too.\n"
+            "`/shell` run a shell command in the sandbox. The agent sees the output too.\n"
             "`/command` run one of the agent's own commands, such as `review`\n\n"
             "**In the main channel** `/model`, `/effort` and `/agent` set what new threads start with, "
             "and `/status` shows those defaults. The rest work inside a thread.",
@@ -596,16 +590,12 @@ def setup(tree, ctx):
     # ------------------------------------------------------------ undo and redo
 
     async def undo_target(entry):
-        """(the request /undo would take back, the file changes it made), or (None, [])."""
+        """The request /undo would take back, or None."""
         session, messages = await session_and_messages(entry)
         requests = [m for m in live_messages(messages, session)[0] if is_request(m)]
-        if not requests:
-            return None, []
-        target = requests[-1]
-        changes = await ctx.agent.diff(entry["sessionId"], entry["directory"], target["info"]["id"])
-        return target, changes or []
+        return requests[-1] if requests else None
 
-    @tree.command(name="undo", description="Take back the last request in this thread, with the file changes it made.")
+    @tree.command(name="undo", description="Take the last request out of this thread's conversation. Files stay as they are.")
     @app_commands.guild_only()
     async def undo(interaction: discord.Interaction):
         entry = await thread_entry(interaction)
@@ -616,12 +606,12 @@ def setup(tree, ctx):
         if ctx.queue.load(interaction.channel_id):
             return await refuse(interaction, busy)
         await interaction.response.defer(ephemeral=True)
-        target, changes = await undo_target(entry)
+        target = await undo_target(entry)
         if target is None:
             return await interaction.followup.send("There is nothing left to undo in this session.", ephemeral=True)
-        # Asked first: the files go back for everyone, and other threads share them.
+        # Asked first: the agent forgets the request for everyone in the thread.
         await interaction.followup.send(
-            undo_question(target, changes),
+            undo_question(target),
             view=confirm_view(target["info"]["id"]),
             ephemeral=True,
             allowed_mentions=NO_MENTIONS,
@@ -639,16 +629,15 @@ def setup(tree, ctx):
 
         async def job():
             try:
-                target, changes = await undo_target(entry) if entry.get("sessionId") else (None, [])
+                target = await undo_target(entry) if entry.get("sessionId") else None
                 if target is None or target["info"]["id"] != message_id:
                     return await ctx.send(
                         channel, "Nothing was undone: this thread changed after the undo was asked for. Use `/undo` again."
                     )
                 await ctx.agent.revert(entry["sessionId"], entry["directory"], message_id)
-                files = f" Files put back: {file_names(changes)}." if changes else " It had changed no files."
                 await ctx.send(
                     channel,
-                    f"↩️ **{who}** undid the last request, “{snippet(asked(target)[1])}”.{files} "
+                    f"↩️ **{who}** undid the last request, “{snippet(asked(target)[1])}”. {FILES_STAY} "
                     "`/redo` brings it back until the next message is sent.",
                 )
             except Exception as err:
@@ -656,7 +645,7 @@ def setup(tree, ctx):
 
         enqueue(interaction, job)
 
-    @tree.command(name="redo", description="Bring back what /undo took back, with its file changes.")
+    @tree.command(name="redo", description="Bring back what /undo took out of the conversation.")
     @app_commands.guild_only()
     async def redo(interaction: discord.Interaction):
         entry = await thread_entry(interaction)
@@ -679,12 +668,12 @@ def setup(tree, ctx):
                 live, _ = live_messages(messages, session)
                 back = sum(1 for m in messages[len(live) :] if is_request(m))
                 await ctx.agent.unrevert(entry["sessionId"], entry["directory"])
-                await answer(f"↪️ **{who}** brought back {plural(back, 'request')} taken back with `/undo`, file changes included.")
+                await answer(f"↪️ **{who}** brought back {plural(back, 'request')} taken back with `/undo`.")
             except Exception as err:
                 log.error("thread %s: /redo failed: %s", interaction.channel_id, err)
                 await answer(f"Something went wrong on my side: {str(err)[:300]}")
 
-        # Queued so no message starts a request while the files are put back.
+        # Queued so it never runs in the middle of a request.
         enqueue(interaction, job)
 
     # ------------------------------------------------------------ fork and rename
@@ -729,7 +718,7 @@ def setup(tree, ctx):
                 await ctx.send(
                     thread,
                     f"This thread carries on from <#{source_id}> with a copy of its conversation and settings. "
-                    "From here the two go their own ways, but both work in the same checkout.",
+                    "From here the two go their own ways, but both work in the same sandbox.",
                 )
                 await ctx.send(channel, f"🍴 Forked into <#{thread.id}>.")
             except Exception as err:
@@ -775,7 +764,7 @@ def setup(tree, ctx):
 
     # ------------------------------------------------------------ running things
 
-    @tree.command(name="shell", description="Run a shell command in the checkout. The agent sees the output too.")
+    @tree.command(name="shell", description="Run a shell command in the sandbox. The agent sees the output too.")
     @app_commands.describe(command="The command, as you would type it in a terminal")
     @app_commands.guild_only()
     async def shell(interaction: discord.Interaction, command: str):

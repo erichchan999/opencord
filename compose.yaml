@@ -1,7 +1,7 @@
 # opencord: a Discord front end to OpenCode.
 #
 #   discord-bridge  - Discord bot. Holds the bot token. Talks to the agent's API.
-#   opencode-agent  - OpenCode server + the repo. Users effectively own this one.
+#   opencode-agent  - OpenCode server + the sandbox. Users effectively own this one.
 #   llm-proxy       - Holds the DeepSeek key and forwards model calls.
 #
 # Nothing from the host is mounted. Each secret is passed only to the container
@@ -46,7 +46,7 @@ services:
       dockerfile: opencode-agent/Dockerfile
       args:
         REVISION: "${OPENCORD_REVISION:-unknown}"
-    env_file: [./secrets/agent.env, ./secrets/shared.env]
+    env_file: [./secrets/shared.env]
     environment:
       ALLOW_INTERNAL: "llm-proxy:8080"
     # NET_ADMIN/NET_RAW: set up the firewall. SETUID/SETGID/SETPCAP: drop to the
@@ -97,6 +97,6 @@ networks:
   bridge-egress: {}
 
 volumes:
-  work: {}         # the shared repo clone all sessions work in
+  work: {}         # /work/sandbox, the folder every session works in
   agent-data: {}   # OpenCode sessions
   bridge-data: {}  # the bridge's thread map, per-thread settings and open questions

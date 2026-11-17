@@ -1,20 +1,20 @@
 # opencord
 
-opencord is a Discord front end to [OpenCode](https://opencode.ai). @mention the bot in an enabled channel and it opens a thread with its own OpenCode session, which works on a GitHub repo of your choice: reading and changing code, running commands and opening pull requests. Everything runs in Docker, with DeepSeek as the model provider.
+opencord is a Discord front end to [OpenCode](https://opencode.ai). @mention the bot in an enabled channel and it opens a thread with its own OpenCode session. Every session works in one shared sandbox folder that starts empty, where the agent can write code, run commands, install packages and clone public repos. Everything runs in Docker, with DeepSeek as the model provider.
 
 ## How it fits together
 
 ```
             ┌────────────────┐  bridge-net  ┌────────────────┐  llm-net  ┌─────────────┐
 Discord ◀──▶│ discord-bridge │─────────────▶│ opencode-agent │──────────▶│  llm-proxy  │──▶ DeepSeek
-            │ bot token      │              │ GitHub token   │           │ DeepSeek key│
-            └────────────────┘              │ repo clone     │           └─────────────┘
+            │ bot token      │              │ /work/sandbox  │           │ DeepSeek key│
+            └────────────────┘              │                │           └─────────────┘
                                             └───────┬────────┘
-                                                    └──▶ GitHub and the open internet
+                                                    └──▶ the open internet
                                                          (host, LAN and other containers blocked)
 ```
 
-Each container reads only its own file in `secrets/`, so none sees another's keys. The bridge and the agent also share the OpenCode server password. State lives in Docker volumes and survives redeploys.
+The bridge and the proxy each read only their own file in `secrets/`, so neither sees the other's key. The bridge and the agent share the OpenCode server password, the agent's only secret. State lives in Docker volumes and survives redeploys.
 
 **Security:** anyone who can post in an enabled channel effectively controls the agent container, including running shell commands in it. Nothing from the host is mounted, the agent's firewall blocks every private address except the proxy, and all containers run without capabilities and with CPU, memory and process limits. The remaining risk is a container escape, which could reach your files.
 
@@ -31,27 +31,12 @@ Each container reads only its own file in `secrets/`, so none sees another's key
    | File | Set |
    | --- | --- |
    | `secrets/proxy.env` | `DEEPSEEK_API_KEY`, from platform.deepseek.com |
-   | `secrets/agent.env` | `REPO` as `owner/name`, and `GH_TOKEN` (step 3) |
-   | `secrets/bridge.env` | `DISCORD_BOT_TOKEN` and `DISCORD_CHANNEL_IDS` (step 5). The limits under [Using it](#using-it) are optional. |
+   | `secrets/bridge.env` | `DISCORD_BOT_TOKEN` and `DISCORD_CHANNEL_IDS` (step 3). The limits under [Using it](#using-it) are optional. |
    | `secrets/shared.env` | `OPENCODE_SERVER_PASSWORD`, any long random string, such as the output of `openssl rand -hex 32` |
 
-3. **GitHub token:** see [GitHub token](#github-token).
+3. **Discord bot:** see [Discord bot](#discord-bot).
 
-4. **Protect `main`:** in the repo, add a ruleset on `main` that requires a pull request with your approval and blocks force pushes and deletion.
-
-5. **Discord bot:** see [Discord bot](#discord-bot).
-
-6. **Start it:** run `./start.sh`. In `./start.sh --logs`, look for `slash commands ready: ...` and `working in #...` for each enabled channel.
-
-### GitHub token
-
-Create a fine-grained personal access token that can reach only the one repo: on GitHub, **Settings** → **Developer settings** → **Personal access tokens** → **Fine-grained tokens** → **Generate new token**.
-
-- **Resource owner:** the account or organization that owns the repo. An organization may have to approve the token.
-- **Repository access:** **Only select repositories**, and pick the repo.
-- **Permissions:** **Contents** and **Pull requests** set to **Read and write**. Leave everything else at **No access**, so nobody can change GitHub Actions workflows through the agent.
-
-Put it in `secrets/agent.env` as `GH_TOKEN`. When it expires, make a new one and run the start script again.
+4. **Start it:** run `./start.sh`. In `./start.sh --logs`, look for `slash commands ready: ...` and `working in #...` for each enabled channel.
 
 ### Discord bot
 
@@ -79,7 +64,7 @@ Put it in `secrets/agent.env` as `GH_TOKEN`. When it expires, make a new one and
 ## Using it
 
 - **New request:** @mention the bot in an enabled channel. It opens a thread, and every message in that thread continues the same session.
-- **One checkout:** every thread works in the same clone of the repo, so two threads editing the same files at once can collide. Ask the agent for a branch when a change needs one.
+- **One sandbox:** every thread works in the same folder, `/work/sandbox`, so two threads editing the same files at once can collide. It isn't a git repo, and the agent has no GitHub credentials.
 - **Parallel threads:** up to `MAX_CONCURRENT` (default 16) threads run at once. Within a thread, messages run one at a time, in order.
 - **Attachments:** text files go to the agent as their content, up to 100 KB each. Other files are passed as links.
 - **Questions:** the agent's questions appear with buttons. Anyone in the thread can answer, and the request's time limit is paused meanwhile.
@@ -104,13 +89,13 @@ A request is stopped, and the thread told, when it hits one of these limits, set
 | `/agent` | Choose the OpenCode agent: `build` (the default) or `plan`, which proposes without editing files |
 | `/status` | Show the thread's settings, whether it is working and how full the context is |
 | `/stop` | Same as `!stop` |
-| `/undo` | Take back the last request and its file changes, after asking. Changes other threads made to those files since are lost too. |
+| `/undo` | Take the last request out of the conversation, after asking. Files in the sandbox stay as they are. |
 | `/redo` | Bring back what `/undo` took back, until the next message |
 | `/clear` | Start the thread over with an empty context, keeping its settings |
 | `/compact` | Replace the conversation so far with a summary, to free up context |
 | `/fork` | Open a new thread that carries on from here |
 | `/rename` | Rename the thread and its session |
-| `/shell` | Run a shell command in the checkout and post its output |
+| `/shell` | Run a shell command in the sandbox and post its output |
 | `/command` | Run one of the agent's own commands or skills, such as `review` |
 | `/help` | List the commands |
 

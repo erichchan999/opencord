@@ -90,11 +90,12 @@ class Store:
         questions = loaded.get("questions") if isinstance(loaded, dict) else None
         questions = questions if isinstance(questions, dict) else {}
         self.questions = {key: entry for key, entry in questions.items() if usable_question(entry)}
-        # Threads from the per-thread-worktree layout move to the shared clone
-        # and get a fresh session on their next message.
+        # Threads from an earlier layout (a worktree per thread, then the repo
+        # clone) move to the sandbox and get a fresh session on their next message.
         for entry in self.threads.values():
+            entry.pop("movedToSharedClone", None)  # the old name of movedFolder
             if entry.get("directory") != self.base_dir:
-                entry.update(directory=self.base_dir, sessionId=None, movedToSharedClone=True)
+                entry.update(directory=self.base_dir, sessionId=None, movedFolder=True)
 
     def save(self):
         # Synchronous on purpose: the file is tiny, and nothing else runs on
