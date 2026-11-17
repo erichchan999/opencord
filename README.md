@@ -6,7 +6,7 @@ opencord is a Discord front end to [OpenCode](https://opencode.ai). @mention the
 
 | Container | Holds | Does |
 | --- | --- | --- |
-| `discord-bridge` | Discord bot token | Watches the channels the bot has been added to, opens threads, and passes messages and slash commands to the agent's API. Follows the agent's event stream for live progress and questions. |
+| `discord-bridge` | Discord bot token | Accepts input from enabled channels, opens threads, and passes messages and slash commands to the agent's API. Follows the agent's event stream for live progress and questions. |
 | `opencode-agent` | Scoped GitHub token | Runs `opencode serve` in a clone of the repo. Anyone in the bot's channel effectively controls this container. |
 | `llm-proxy` | DeepSeek API key | Forwards only chat completions and the model list to DeepSeek, adds the real key, and limits the agent to 240 requests a minute. |
 
@@ -46,7 +46,7 @@ The remaining risk is a container escape or a Linux kernel exploit. Docker Deskt
    | --- | --- |
    | `secrets/proxy.env` | `DEEPSEEK_API_KEY`, from platform.deepseek.com |
    | `secrets/agent.env` | `REPO`, the repo the agent works on, as `owner/name`, and `GH_TOKEN` (step 3) |
-   | `secrets/bridge.env` | `DISCORD_BOT_TOKEN` (step 5). Optionally `MAX_CONCURRENT` (default 16) and the time limits under [Using it](#using-it). |
+   | `secrets/bridge.env` | `DISCORD_BOT_TOKEN` (step 5). Optionally `DISCORD_CHANNEL_IDS`, `MAX_CONCURRENT` (default 16) and the time limits under [Using it](#using-it). |
    | `secrets/shared.env` | `OPENCODE_SERVER_PASSWORD`, any long random string, such as the output of `openssl rand -hex 32` |
 
 3. **GitHub token:** see [GitHub token](#github-token).
@@ -55,7 +55,7 @@ The remaining risk is a container escape or a Linux kernel exploit. Docker Deskt
 
 5. **Discord bot:** see [Discord bot](#discord-bot).
 
-6. **Start it:** run `./start.sh`. It warns about any secret that's still a placeholder, then builds the images and starts the containers. In the log (`./start.sh --logs`), look for `working in #<channel>`, which also names any missing permissions, followed by `slash commands ready: ...`. A warning that starts `I can also read` means a category was missed in step 6 of [Discord bot](#discord-bot).
+6. **Start it:** run `./start.sh`. It warns about any secret that's still a placeholder, then builds the images and starts the containers. In `./start.sh --logs`, look for `slash commands ready: ...` and `working in #...` for each enabled channel.
 
 ### GitHub token
 
@@ -70,7 +70,9 @@ The agent pushes and opens pull requests with a fine-grained personal access tok
 
 ### Discord bot
 
-The bot works only in channels whose own permissions name it, and in the threads it opens there. Discord settings also keep it out of every other channel, so it never sees their messages.
+OpenCord accepts input from the text channels listed in `secrets/bridge.env` and the threads it opens in them. Anyone who can post in an enabled channel can use the coding agent, including `/shell` in its threads, so enable channels whose members you trust with the checkout.
+
+Discord's **View Channel** permission controls which messages the bot receives. OpenCord ignores input from disabled channels even if Discord delivers it.
 
 1. **Create the app:** in the [Developer Portal](https://discord.com/developers/applications), click **New Application** and give it a name. That name is what people @mention.
 2. **Installation** page: under Installation Contexts, untick **User Install**, leaving **Guild Install**. Set **Install Link** to **None** and save. Discord won't let you turn off Public Bot while an install link is set.
@@ -84,10 +86,19 @@ The bot works only in channels whose own permissions name it, and in the threads
    https://discord.com/oauth2/authorize?client_id=<application id>&scope=bot&permissions=309237745728
    ```
 
-   Discord gives the bot a role with its name, with Send Messages, Read Message History, Create Public Threads, Send Messages in Threads, Add Reactions and Attach Files. The link leaves out View Channel: the bot sees only the channel you add it to next. The `bot` scope also covers the slash commands.
-5. **Add it to its channel:** open the channel's settings → **Permissions** → **Advanced permissions**, add the bot's role, and allow View Channel, Send Messages, Send Messages in Threads, Create Public Threads, Read Message History, Add Reactions and Attach Files. Set this on the channel, not its category, or the bot works in every channel synced to that category.
-6. **Keep it out of everything else:** a bot sees every channel @everyone can, and no role setting can take that away. Only a deny on the channel or category can. For every category, open its settings → **Permissions**, add the bot's role and deny View Channel. Channels synced to a category follow it, and the bot's own channel keeps its allow from step 5. Do the same for every channel that isn't in a category or isn't synced with its category. Whenever you add a category or channel later, deny the bot there too. If you miss one, the bot reads that channel's messages but ignores them.
-7. **Limit the slash commands:** Discord shows the bot's commands in every channel by default. In **Server Settings** → **Integrations** → the bot → **Manage**, under Channels, turn off **All Channels** and add the bot's channel. Its threads follow it. The bot refuses commands from other channels anyway; this hides them there.
+   Discord gives the bot a role with its name, with Send Messages, Read Message History, Create Public Threads, Send Messages in Threads, Add Reactions and Attach Files. The link leaves out View Channel, which the bot can still inherit from @everyone or a channel override. The `bot` scope also covers slash commands.
+5. **Give the bot permission in the channels you want to use:** open each channel's settings → **Permissions** → **Advanced permissions**. Add the bot's role and allow View Channel, Send Messages, Send Messages in Threads, Create Public Threads, Read Message History, Add Reactions and Attach Files as needed.
+6. **Choose what Discord delivers to the bot:** to keep messages from other channels away from the bot, deny **View Channel** for its role on their categories and on any uncategorized or unsynced channels. Check new categories and channels when you add them. The startup log lists disabled channels the bot can still see.
+7. **Enable OpenCord:** set `DISCORD_CHANNEL_IDS` in `secrets/bridge.env` to a comma-separated list of text channel IDs. In Discord, enable **Developer Mode** under **User Settings** → **Advanced**, then right-click each channel and choose **Copy Channel ID**. For example:
+
+   ```dotenv
+   DISCORD_CHANNEL_IDS=123456789012345678,234567890123456789
+   ```
+
+   An empty list disables session input everywhere. To change access, edit the list and rerun the start script. The bridge logs which channels are enabled and any Discord permissions they need.
+8. **Limit command visibility if you want:** in **Server Settings** → **Integrations** → the bot → **Manage**, you can restrict which channels show the session commands.
+
+**Upgrading an existing install:** keep the bot's Discord permissions and add the IDs of every channel you want to use to `DISCORD_CHANNEL_IDS`. Existing threads and sessions can pick up with a new message once their parent channel is enabled.
 
 ## Running it
 
@@ -103,7 +114,7 @@ Each deploy labels every container `opencord.revision` with this folder's commit
 ## Using it
 
 - **New request:** @mention the bot in its channel. It opens a thread with a new OpenCode session.
-- **Follow-ups:** any message in that thread continues the same session. Taking the bot out of a channel silences its threads there.
+- **Follow-ups:** a message in that thread continues the same session while its parent channel is enabled. Disabling the parent blocks new input and question answers, and queued input is checked again before it runs. Work already running can finish, and `!stop` or `/stop` still stops it.
 - **One checkout:** every thread works in the same clone, `/work/repo`. Two threads editing the same files at the same time can collide. The bridge makes no branches, so ask the agent for one when a change needs it.
 - **Parallel threads:** up to `MAX_CONCURRENT` threads run at once, and further requests wait in a queue. Within a thread, messages run one at a time, in order.
 - **Attachments:** text files go to the agent as their content, up to 100 KB each and 200 KB per message. Other files, such as images, and larger ones are passed as links the agent can try to fetch.
@@ -125,7 +136,7 @@ A request is stopped, and the thread is told, when it hits one of these limits. 
 
 ### Slash commands
 
-Anyone who can post in the bot's channel can use them. Changes are announced in the thread. `/status`, `/todo`, `/help` and the `/undo` confirmation are shown only to the person who used them.
+Anyone who can post in an enabled channel can use its session commands. Changes are announced in the thread. `/status`, `/todo`, `/help` and the `/undo` confirmation are shown only to the person who used them.
 
 | Command | What it does |
 | --- | --- |
@@ -147,7 +158,7 @@ Anyone who can post in the bot's channel can use them. Changes are announced in 
 | `/command` | Run one of the agent's own commands or skills, such as `review` |
 | `/help` | List the commands |
 
-- **In the main channel** (outside any thread), `/model`, `/effort` and `/agent` set what new threads start with, and `/status` shows those defaults. A new thread copies the defaults when it opens, so later changes leave existing threads alone. The other commands work only inside a thread.
+- **In an enabled text channel** (outside any thread), `/model`, `/effort` and `/agent` set what new threads start with, and `/status` shows those defaults. A new thread copies the defaults when it opens. Session actions like `/stop` and `/shell` are used inside a thread.
 - **`default`** as the value puts a setting back on the agent's own config.
 - **While a request runs**, a settings change applies from the next message. `/compact`, `/fork`, `/shell` and `/command` wait their turn like a message would. `/undo` and `/redo` refuse.
 - **`/undo` and the shared checkout:** undo puts the request's files back as they were before it. If another thread has changed those files since, its changes to them are lost too. The confirmation warns about this.

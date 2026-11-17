@@ -12,10 +12,10 @@ from fakes import Channel, Interaction
 from sample import FLASH, PRO, snapshot
 from state import Store
 
-CHANNEL = 500  # a channel the bot has been added to
+CHANNEL = 500  # an enabled channel
 THREAD = 600  # a thread the bridge opened in it
 STRANGER = 650  # a thread in it the bridge did not open
-ELSEWHERE = 999  # a channel the bot has not been added to
+ELSEWHERE = 999  # a channel that is not enabled
 
 
 class Queue:
@@ -116,9 +116,10 @@ class Harness:
         self.opened = []  # (channel id, name, starter text) of threads opened
         self.tree = app_commands.CommandTree(discord.Client(intents=discord.Intents.none()))
         self.home = Channel(CHANNEL, "agent")
+        self.enabled = True
 
         async def home_of(channel):
-            return self.home if channel.id in (CHANNEL, THREAD, STRANGER, 700) else None
+            return self.home if self.enabled and channel.id in (CHANNEL, THREAD, STRANGER, 700) else None
 
         async def stop_thread(thread_id, entry, stop_point):
             self.stopped.append((thread_id, stop_point))
@@ -211,12 +212,30 @@ ALL_COMMANDS = {
 
 
 def test_commands_fit_discords_limits(tmp_path):
-    registered = {c.name: c for c in Harness(tmp_path).tree.get_commands()}
-    assert set(registered) == ALL_COMMANDS
-    for command in registered.values():
+    registered = Harness(tmp_path).tree.get_commands()
+    assert {command.name for command in registered} == ALL_COMMANDS
+    for command in registered:
         assert 1 <= len(command.description) <= 100, command.name
         for parameter in command.parameters:
             assert 1 <= len(parameter.description) <= 100, (command.name, parameter.name)
+
+
+def test_a_queued_shell_is_skipped_when_its_channel_is_disabled(tmp_path):
+    h = Harness(tmp_path)
+    interaction = h.run("shell", command="ls")
+    assert len(h.queue.jobs) == 1
+    h.enabled = False
+    h.queue.run_all()
+    assert h.agent.calls == []
+    assert interaction.followup.sent == [("Skipped: OpenCord was disabled in this channel before this could run.", False)]
+
+
+def test_stop_still_works_once_the_channel_is_disabled(tmp_path):
+    h = Harness(tmp_path)
+    h.queue.busy = 1
+    h.enabled = False
+    h.run("stop")
+    assert h.stopped == [(THREAD, 7)]
 
 
 def test_model_in_a_thread_changes_that_thread(tmp_path):
@@ -264,14 +283,14 @@ def test_commands_do_nothing_outside_the_channels_and_threads_the_bot_works_in(t
     for place in (ELSEWHERE, STRANGER):
         for command, arguments in everywhere + THREAD_COMMANDS:
             text, private = only_reply(h.run(command, place, **arguments))
-            assert private and "channels I've been added to" in text, (place, command)
+            assert private and "enabled channels" in text, (place, command)
     assert h.store.defaults == {} and h.stopped == [] and h.queue.jobs == [] and h.agent.calls == []
 
 
 def test_help_points_to_the_channel_it_is_used_under(tmp_path):
     h = Harness(tmp_path)
     assert f"mention me in <#{CHANNEL}>" in only_reply(h.run("help", THREAD))[0]
-    assert "mention me in a channel I've been added to" in only_reply(h.run("help", ELSEWHERE))[0]
+    assert "mention me in an enabled channel" in only_reply(h.run("help", ELSEWHERE))[0]
 
 
 def test_thread_only_commands_say_so_in_the_main_channel(tmp_path):

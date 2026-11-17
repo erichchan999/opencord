@@ -1,11 +1,11 @@
 """discord-bridge: connects Discord to the OpenCode server.
 
-- @mention the bot in a channel it has been added to (access.py) -> it opens
+- @mention the bot in an enabled channel -> it opens
   a thread with its own OpenCode session and answers there. Every session
   works in the shared clone (BASE_DIR); the agent can make branches or
   worktrees itself if asked.
 - Any later message in that thread continues the same session, for as long
-  as the bot stays added to the thread's channel.
+  as the thread's parent channel stays enabled.
 - Threads run in parallel, up to MAX_CONCURRENT at once.
 - "!stop" in a thread aborts the running request and drops that thread's
   queued ones. A request is also stopped when it works longer than
@@ -73,6 +73,7 @@ OPENCODE_URL = env("OPENCODE_URL", "http://opencode-agent:4096")
 OPENCODE_PASSWORD = env("OPENCODE_SERVER_PASSWORD")
 STATE_FILE = os.environ.get("STATE_FILE", "/data/threads.json")
 BASE_DIR = os.environ.get("BASE_DIR", "/work/repo")
+CHANNEL_IDS = set(map(str.strip, os.environ.get("DISCORD_CHANNEL_IDS", "").split(","))) - {""}
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "16"))
 # Longest a request may work, not counting time spent waiting for a person to
 # answer a question.
@@ -333,17 +334,17 @@ def register_thread(thread, author):
 
 async def home_of(channel):
     """The text channel the bot works under for `channel`: the channel itself, or
-    a thread's parent. None when the bot has not been added there (access.py)."""
+    a thread's parent. None when OpenCord cannot accept input there."""
     if not isinstance(channel, (discord.Thread, discord.abc.GuildChannel)):
         # Missing from discord.py's cache (a PartialMessageable), so ask Discord.
-        # Unknown counts as not added.
+        # Unknown channels are disabled.
         found = client.get_channel(channel.id)
         if found is None:
             with contextlib.suppress(discord.HTTPException):
                 found = await client.fetch_channel(channel.id)
         channel = found
     home = channel.parent if isinstance(channel, discord.Thread) else channel
-    return home if isinstance(home, discord.TextChannel) and access.added_here(home) else None
+    return home if isinstance(home, discord.TextChannel) and access.enabled(home, CHANNEL_IDS) else None
 
 
 def channel_for(thread_id):
@@ -385,6 +386,7 @@ questions = Questions(
     agent,
     BASE_DIR,
     channel_for=channel_for,
+    home_of=home_of,
     thread_for_session=thread_for_session,
     on_open=question_opened,
     on_close=question_closed,
@@ -773,20 +775,17 @@ async def on_message(message):
 
     # Follow-ups inside a thread this bridge owns. Looked up by ID rather than
     # channel type, so a thread missing from discord.py's cache still works.
-    # Only threads in a channel the bot is still added to count.
-    # That lookup can wait on Discord, so nothing is queued after it:
-    # follow-ups check it inside their queued job, and "!stop" takes its stop
-    # point first. Either way the thread's messages keep their order.
+    # Only threads in a channel that is still enabled count, except for "!stop",
+    # so work already running can still be stopped after a channel is disabled.
+    # That check can wait on Discord, so nothing is queued after it: follow-ups
+    # make it inside their queued job, and the thread's messages keep their order.
     entry = store.threads.get(str(channel.id))
     if entry is not None:
         text = clean_content(message, bot_id)
         if not text and not message.attachments:
             return
         if text == "!stop":
-            stop_point = queue.stop_point()
-            if await home_of(channel) is None:
-                return
-            await stop_thread(channel.id, entry, stop_point)
+            await stop_thread(channel.id, entry, queue.stop_point())
             with contextlib.suppress(discord.HTTPException):
                 await message.add_reaction("🛑")
             return
@@ -807,18 +806,17 @@ async def on_message(message):
             )
 
         async def follow_up():
-            if await home_of(channel) is None:
-                return
             try:
                 files, links = await attachment_parts(message)
-                await run_turn(channel, entry, message.author, with_links(text, links), files)
+                if await home_of(channel) is not None:
+                    await run_turn(channel, entry, message.author, with_links(text, links), files)
             except Exception as err:
                 await report_failure(channel, err)
 
         queue.submit(channel.id, follow_up)
         return
 
-    # New requests: an @mention in a channel the bot has been added to.
+    # New requests: an @mention in an enabled channel.
     if not mentions_bot(message, bot_id):
         return
     home = await home_of(channel)
@@ -850,7 +848,8 @@ async def on_message(message):
     async def new_request():
         try:
             files, links = await attachment_parts(message)
-            await run_turn(thread, entry, message.author, with_links(text, links), files)
+            if await home_of(home) is not None:
+                await run_turn(thread, entry, message.author, with_links(text, links), files)
         except Exception as err:
             await report_failure(thread, err)
 
@@ -919,6 +918,12 @@ async def on_ready():
         log.warning("not in any server yet. Invite the bot with the link in the README.")
     for guild in client.guilds:
         await prepare_server(guild)
+    found = {str(channel.id) for guild in client.guilds for channel in guild.text_channels}
+    if unknown := sorted(CHANNEL_IDS - found):
+        log.warning(
+            "DISCORD_CHANNEL_IDS lists %s, which is not a text channel in any of my servers. Check the ID.",
+            ", ".join(unknown),
+        )
 
 
 @client.event
@@ -928,12 +933,12 @@ async def on_guild_join(guild):
 
 async def prepare_server(guild):
     """Logs where the bot works in `guild` and registers the slash commands there."""
-    added = access.channels_added(guild)
-    if not added:
-        log.warning("%s: not added to any channel yet, so I ignore everything there. See the README.", guild.name)
-    for channel in added:
+    enabled = [channel for channel in guild.text_channels if access.enabled(channel, CHANNEL_IDS)]
+    if not enabled:
+        log.warning("%s: no enabled channels. Check DISCORD_CHANNEL_IDS and the bot's View Channel permission.", guild.name)
+    for channel in enabled:
         log_working_in(channel)
-    ignored = access.seen_but_not_added(guild)
+    ignored = [channel for channel in guild.text_channels if access.visible(channel) and channel not in enabled]
     if ignored:
         log.warning(
             "%s: I can also read these channels, which I ignore: %s. Deny me View Channel there to keep their messages away (README).",
@@ -962,19 +967,11 @@ def log_working_in(channel):
     log.info("%s: working in #%s%s", channel.guild.name, channel.name, shown)
 
 
-# Someone adding the bot to a channel, or taking it out, shows in the log
-# without a restart.
-@client.event
-async def on_guild_channel_create(channel):
-    if isinstance(channel, discord.TextChannel) and access.added_here(channel):
-        log_working_in(channel)
-
-
 @client.event
 async def on_guild_channel_update(before, after):
     if not isinstance(after, discord.TextChannel):
         return
-    was, now = access.added_here(before), access.added_here(after)
+    was, now = access.enabled(before, CHANNEL_IDS), access.enabled(after, CHANNEL_IDS)
     if now and not was:
         log_working_in(after)
     elif was and not now:

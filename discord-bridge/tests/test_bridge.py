@@ -18,10 +18,10 @@ from fakes import Channel
 from opencode import OpenCodeError
 from sample import FLASH, messages_from, recorded, root_session, snapshot
 
-CHANNEL = 500  # a channel the bot has been added to
+CHANNEL = 500  # an enabled channel
 THREAD = 600  # a thread the bridge opened in it
 STRANGER = 650  # a thread in it the bridge did not open
-ELSEWHERE = 999  # a channel the bot has not been added to
+ELSEWHERE = 999  # a channel that is not enabled
 BOT_ID = 1234
 AUTHOR = types.SimpleNamespace(name="erich", display_name="Erich", id=42, bot=False)
 
@@ -364,19 +364,19 @@ class Jobs:
 
 @pytest.fixture
 def server(world, monkeypatch):
-    """`world`, plus which channels the bot has been added to (CHANNEL, and with it its threads)."""
+    """`world`, plus which channels are enabled (CHANNEL, and with it its threads)."""
     world.home = Channel(CHANNEL, "agent")
-    world.added = True
+    world.enabled = True
 
     async def home_of(channel):
-        return world.home if world.added and channel.id in (CHANNEL, THREAD, STRANGER) else None
+        return world.home if world.enabled and channel.id in (CHANNEL, THREAD, STRANGER) else None
 
     monkeypatch.setattr(bridge, "home_of", home_of)
     monkeypatch.setattr(bridge, "queue", Jobs())
     return world
 
 
-def test_a_mention_in_a_channel_the_bot_was_added_to_opens_a_thread(server):
+def test_a_mention_in_an_enabled_channel_opens_a_thread(server):
     message = Message(Channel(CHANNEL), "fix the login bug")
     asyncio.run(bridge.on_message(message))
     assert [thread.name for thread in message.threads] == ["fix the login bug"]
@@ -397,11 +397,14 @@ def test_a_mention_in_someone_elses_thread_points_back_to_the_channel(server):
     assert message.threads == [] and bridge.queue.submitted == []
 
 
-def test_a_thread_goes_quiet_once_the_bot_is_taken_out_of_its_channel(server):
-    server.added = False
+def test_a_thread_goes_quiet_once_its_channel_is_disabled(server):
+    asyncio.run(bridge.on_message(Message(server.thread, "queued before", mention=False)))
+    server.enabled = False
     asyncio.run(bridge.on_message(Message(server.thread, "still there?", mention=False)))
-    ((_, job),) = bridge.queue.submitted  # queued, so it keeps its place, and checked when it runs
-    asyncio.run(job())
+    # Both queued, so the thread's messages keep their order, and checked when they run.
+    assert len(bridge.queue.submitted) == 2
+    for _, job in bridge.queue.submitted:
+        asyncio.run(job())
     assert server.agent.prompts == [] and server.thread.sent == []
 
 

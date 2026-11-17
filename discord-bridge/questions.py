@@ -135,11 +135,12 @@ class Questions:
     and messages holds the Discord message of each question.
     """
 
-    def __init__(self, store, agent, directory, *, channel_for, thread_for_session, on_open, on_close):
+    def __init__(self, store, agent, directory, *, channel_for, home_of, thread_for_session, on_open, on_close):
         self._store = store
         self._agent = agent
         self._directory = directory
         self._channel_for = channel_for  # (thread id) -> something to send to
+        self._home_of = home_of  # async (channel) -> its enabled parent, or None
         self._thread_for_session = thread_for_session  # async (session id) -> thread id or None
         self._on_open = on_open  # (thread id), when a request starts waiting on people
         self._on_close = on_close  # (thread id), when it stops
@@ -308,7 +309,14 @@ class Questions:
 
     async def _open_entry(self, interaction, request_id, index):
         """The request's entry if this question can still be answered. Otherwise tells the person and returns None."""
+        channel = interaction.channel or self._channel_for(interaction.channel_id)
+        if await self._home_of(channel) is None:
+            await interaction.response.send_message("OpenCord is disabled in this channel.", ephemeral=True)
+            return None
         entry = self._store.questions.get(request_id)
+        if entry is not None and entry["thread"] != str(interaction.channel_id):
+            await interaction.response.send_message(GONE, ephemeral=True)
+            return None
         if entry is None or index >= len(entry["questions"]):
             content = getattr(interaction.message, "content", None)
             if content and GONE not in content:

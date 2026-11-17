@@ -1,7 +1,7 @@
 """Slash commands: the Discord side of OpenCode's session settings and controls.
 
-The commands are registered to every server the bot is in, and work only in
-the channels it has been added to (access.py) and the threads it opened there.
+The commands are registered to every server the bot is in. Session commands
+work only in enabled channels and the threads the bot opened there.
 Inside one of the bridge's threads they act on that thread. /model, /effort
 and /agent used in the main channel set what new threads start with, in every
 channel the bot works in.
@@ -342,7 +342,7 @@ async def gather_limited(calls, limit=4):
 
 def setup(tree, ctx):
     """Adds the commands to `tree`."""
-    wrong_place = "I only work in the channels I've been added to and the threads I open there."
+    wrong_place = "I only work in enabled channels and the threads I open there."
     thread_only = "Use this inside one of my threads."
     busy = "I'm working on a request in this thread. Wait for it to finish, or `/stop` it, then try again."
     nothing_to_redo = "There is nothing to redo. `/redo` works after `/undo`, until the next message is sent."
@@ -352,7 +352,7 @@ def setup(tree, ctx):
 
     async def scope_of(interaction):
         """("thread", its entry) in one of the bridge's threads, ("channel", the defaults) in
-        a channel the bot has been added to, (None, None) anywhere else.
+        an enabled channel, (None, None) anywhere else.
 
         Discord delivers commands from every channel, even ones the bot cannot
         see, so this is the gate for them."""
@@ -369,6 +369,18 @@ def setup(tree, ctx):
 
     async def refuse(interaction, text):
         await say(interaction, text, private=True)
+
+    def enqueue(interaction, job):
+        """Queues `job` for the thread. Skipped, and the person told, if the channel was disabled meanwhile."""
+
+        async def run_if_enabled():
+            channel = channel_of(interaction)
+            if await ctx.home_of(channel) is not None:
+                return await job()
+            # Also answers a deferred command, which would otherwise stay "thinking".
+            await later(interaction, channel)("Skipped: OpenCord was disabled in this channel before this could run.")
+
+        ctx.queue.submit(interaction.channel_id, run_if_enabled)
 
     async def thread_entry(interaction):
         """The entry of the thread the command was used in. Refuses and returns None elsewhere."""
@@ -631,7 +643,7 @@ def setup(tree, ctx):
     @app_commands.guild_only()
     async def help_(interaction: discord.Interaction):
         home = await ctx.home_of(channel_of(interaction))
-        where = f"<#{home.id}>" if home is not None else "a channel I've been added to"
+        where = f"<#{home.id}>" if home is not None else "an enabled channel"
         await refuse(
             interaction,
             f"**Start:** mention me in {where} with a question or a task. I open a thread, "
@@ -668,7 +680,9 @@ def setup(tree, ctx):
         # Taken first, so a message sent after this command is not dropped
         # while the checks below wait on Discord.
         stop_point = ctx.queue.stop_point()
-        entry = await thread_entry(interaction)
+        # Any of the bridge's threads, even after its channel was disabled, so
+        # work already running can still be stopped.
+        entry = ctx.store.threads.get(str(interaction.channel_id)) or await thread_entry(interaction)
         if entry is None:
             return
         if not ctx.queue.load(interaction.channel_id):
@@ -734,7 +748,7 @@ def setup(tree, ctx):
         waiting = ctx.queue.load(interaction.channel_id)
         note(interaction, "compact")
         # Queued like a message, so it never runs in the middle of a request.
-        ctx.queue.submit(interaction.channel_id, job)
+        enqueue(interaction, job)
         await say(interaction, "Compacting this thread's conversation" + (" after the current request." if waiting else "."))
 
     # ------------------------------------------------------------ undo and redo
@@ -798,7 +812,7 @@ def setup(tree, ctx):
             except Exception as err:
                 await ctx.report_failure(channel, err)
 
-        ctx.queue.submit(interaction.channel_id, job)
+        enqueue(interaction, job)
 
     @tree.command(name="redo", description="Bring back what /undo took back, with its file changes.")
     @app_commands.guild_only()
@@ -829,7 +843,7 @@ def setup(tree, ctx):
                 await answer(f"Something went wrong on my side: {str(err)[:300]}")
 
         # Queued so no message starts a request while the files are put back.
-        ctx.queue.submit(interaction.channel_id, job)
+        enqueue(interaction, job)
 
     # ------------------------------------------------------------ fork and rename
 
@@ -882,7 +896,7 @@ def setup(tree, ctx):
         note(interaction, "fork")
         waiting = queued(interaction)
         # Queued so the copy never catches a request half done.
-        ctx.queue.submit(interaction.channel_id, job)
+        enqueue(interaction, job)
         await say(interaction, f"Forking this thread{waiting}.")
 
     @tree.command(name="rename", description="Rename this thread and its OpenCode session.")
@@ -964,7 +978,7 @@ def setup(tree, ctx):
 
         note(interaction, "shell")
         waiting = queued(interaction)
-        ctx.queue.submit(interaction.channel_id, job)
+        enqueue(interaction, job)
         await say(interaction, f"🖥️ **{name_of(interaction.user)}** runs `{plain(command, 300)}`{waiting}.")
 
     async def command_choices(interaction: discord.Interaction, typed: str):
@@ -996,7 +1010,7 @@ def setup(tree, ctx):
 
         note(interaction, f"command {name}")
         waiting = queued(interaction)
-        ctx.queue.submit(interaction.channel_id, job)
+        enqueue(interaction, job)
         shown = f"/{name} {plain(arguments, 300)}".rstrip()
         await say(interaction, f"▶️ **{name_of(interaction.user)}** runs `{shown}`{waiting}.")
 

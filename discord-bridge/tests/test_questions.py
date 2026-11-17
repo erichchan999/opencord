@@ -61,13 +61,18 @@ class Harness:
         self.agent = Agent()
         self.channel = Channel(THREAD)
         self.opened, self.closed = [], []
+        self.enabled = True
 
         async def thread_for_session(session_id):
             return THREAD if session_id == SESSION else None
 
+        async def home_of(channel):
+            return self.channel if self.enabled else None
+
         self.questions = Questions(
             self.store, self.agent, "/work/repo",
             channel_for=lambda thread_id: self.channel,
+            home_of=home_of,
             thread_for_session=thread_for_session,
             on_open=self.opened.append,
             on_close=self.closed.append,
@@ -153,6 +158,21 @@ def test_clicking_an_option_answers_the_agent(tmp_path):
     assert interaction.response.edited == [("❓ **Which letter?**\n**Answer:** B (from Tester)", None)]
     assert h.agent.replies == [("que_1", [["B"]])]
     assert h.store.questions == {} and h.saved().questions == {} and h.closed == [THREAD]
+
+
+def test_revocation_blocks_buttons_and_open_modals_without_closing_the_question(tmp_path):
+    h = Harness(tmp_path)
+    asyncio.run(h.questions.ask(SESSION, request("que_1", LETTER)))
+    h.enabled = False
+    button = h.click("que_1", 0, "o", option=0)
+    modal = Interaction(THREAD)
+    asyncio.run(h.questions.answer_typed(modal, "que_1", 0, "C"))
+    for interaction in (button, modal):
+        assert interaction.response.sent == [("OpenCord is disabled in this channel.", True)]
+    assert h.agent.replies == [] and h.questions.open_for(THREAD) == ["que_1"]
+    h.enabled = True
+    h.click("que_1", 0, "o", option=0)
+    assert h.agent.replies == [("que_1", [["A"]])]
 
 
 def test_every_question_of_a_request_must_be_answered_before_it_is_sent(tmp_path):
