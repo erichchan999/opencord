@@ -64,6 +64,7 @@ The bridge and the proxy each read only their own file in `secrets/`, so neither
 ## Using it
 
 - **New request:** @mention the bot in an enabled channel. It opens a thread, and every message in that thread continues the same session.
+- **Set up first:** @mention the bot with nothing else to open an empty thread. Choose `/model`, `/effort` or `/agent` there, then send your question. The thread is named after it.
 - **One sandbox:** every thread works in the same folder, `/work/sandbox`, so two threads editing the same files at once can collide. It isn't a git repo, and the agent has no GitHub credentials.
 - **Parallel threads:** up to `MAX_CONCURRENT` (default 16) threads run at once. Within a thread, messages run one at a time, in order.
 - **Attachments:** text files go to the agent as their content, up to 100 KB each. Other files are passed as links.

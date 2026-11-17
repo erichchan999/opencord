@@ -524,6 +524,19 @@ def test_rename_renames_the_thread_and_its_session(tmp_path):
     assert "can't be empty" in only_reply(h.run("rename", name="   "))[0]
 
 
+def test_rename_keeps_its_name_when_the_first_request_comes(tmp_path):
+    h = Harness(tmp_path)
+    h.entry["placeholderName"] = True  # opened by an empty mention
+    h.thread.fail_edit = discord.Forbidden(type("R", (), {"status": 403, "reason": "no"})(), "Missing Access")
+    h.run("rename", name="Nope")
+    assert h.entry["placeholderName"] is True  # nothing was renamed, so the first request still names it
+
+    h.thread.fail_edit = None
+    h.run("rename", name="Chosen name")
+    assert h.thread.name == "Chosen name" and "placeholderName" not in h.entry
+    assert "placeholderName" not in h.saved().threads[str(THREAD)]
+
+
 # ---------------------------------------------------------------- undo and redo
 
 
@@ -636,10 +649,19 @@ def test_fork_opens_a_thread_with_a_copy_of_the_session(tmp_path):
     assert h.opened == [(CHANNEL, "Fix the login bug (fork)", f"🍴 **Tester** forked <#{THREAD}> into a new thread.")]
     copy = h.saved().threads["700"]
     assert copy["sessionId"] == "ses_fork" and copy["model"] == PRO and copy["agent"] == "plan" and "effort" not in copy
+    assert "placeholderName" not in copy
     assert ("rename", "ses_fork", "Discord: Fix the login bug (fork)") in h.agent.calls
     assert h.posted_to[0][0] == 700 and f"carries on from <#{THREAD}>" in h.posted_to[0][1]
     assert "both work in the same sandbox" in h.posted_to[0][1]
     assert h.posted_to[1] == (THREAD, "🍴 Forked into <#700>.")
+
+
+def test_a_fork_of_a_thread_still_unnamed_is_named_by_its_own_first_request(tmp_path):
+    h = Harness(tmp_path)
+    h.entry.update(sessionId="ses_1", placeholderName=True)  # opened empty, then a /shell ran
+    h.run("fork")
+    h.queue.run_all()
+    assert h.saved().threads["700"]["placeholderName"] is True
 
 
 def test_fork_after_an_undo_leaves_the_undone_part_behind(tmp_path):

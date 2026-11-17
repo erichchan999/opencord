@@ -224,6 +224,16 @@ def confirm_view(message_id):
     return view
 
 
+async def rename_thread(thread, client, name):
+    """Renames a thread, fetching it first if discord.py's cache gave a stand-in that can't be edited.
+
+    Raises TimeoutError after RENAME_WAIT seconds, or Discord's error.
+    """
+    if not hasattr(thread, "edit"):
+        thread = await client.fetch_channel(thread.id)
+    await asyncio.wait_for(thread.edit(name=name), RENAME_WAIT)
+
+
 def fork_name(name):
     base = re.sub(r" \(fork(?: \d+)?\)$", "", name or "thread")
     return f"{base[:90]} (fork)"
@@ -473,7 +483,8 @@ def setup(tree, ctx):
         await refuse(
             interaction,
             f"**Start:** mention me in {where} with a question or a task. I open a thread, "
-            "and every later message in it continues the same session. Text files you attach are sent "
+            "and every later message in it continues the same session. Mention me with nothing else to open "
+            "an empty thread you can set up before you ask. Text files you attach are sent "
             "to the agent as their content.\n\n"
             "**Settings**\n"
             "`/model` choose the model\n"
@@ -711,6 +722,8 @@ def setup(tree, ctx):
                 for setting in SETTINGS:
                     set_setting(copy, setting, entry.get(setting))
                 copy["sessionId"] = forked["id"]
+                if entry.get("placeholderName"):
+                    copy["placeholderName"] = True  # still unnamed: its first request names it
                 ctx.store.save()
                 log.info("thread %s: forked into thread %s, session %s", source_id, thread.id, forked["id"])
                 with contextlib.suppress(Exception):
@@ -742,11 +755,8 @@ def setup(tree, ctx):
             return await refuse(interaction, "The new name can't be empty.")
         await interaction.response.defer()
         note(interaction, "rename")
-        thread = channel_of(interaction)
         try:
-            if not hasattr(thread, "edit"):
-                thread = await interaction.client.fetch_channel(interaction.channel_id)
-            await asyncio.wait_for(thread.edit(name=name), RENAME_WAIT)
+            await rename_thread(channel_of(interaction), interaction.client, name)
         except TimeoutError:
             return await interaction.followup.send(
                 "Discord did not rename the thread within 10 seconds, so I gave up. It allows only two renames "
@@ -755,6 +765,8 @@ def setup(tree, ctx):
             )
         except discord.HTTPException as err:
             return await interaction.followup.send(f"Discord did not let me rename this thread: {err}", allowed_mentions=NO_MENTIONS)
+        if entry.pop("placeholderName", None):
+            ctx.store.save()  # a name someone chose is kept when the first request comes
         if entry.get("sessionId"):
             try:
                 await ctx.agent.rename(entry["sessionId"], entry["directory"], session_title(name))

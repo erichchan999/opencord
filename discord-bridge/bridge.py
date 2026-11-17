@@ -3,6 +3,8 @@
 - @mention the bot in an enabled channel -> it opens
   a thread with its own OpenCode session and answers there. Every session
   works in the same sandbox folder (BASE_DIR), which is not a git repo.
+  A mention with nothing else opens an empty thread to set up first, named
+  after its first request.
 - Any later message in that thread continues the same session, for as long
   as the thread's parent channel stays enabled.
 - Threads run in parallel, up to MAX_CONCURRENT at once.
@@ -494,10 +496,12 @@ async def prompt_settings(thread, entry):
     return options, " · ".join(label)
 
 
-async def ensure_session(thread, entry):
-    """The thread's session id. A thread that has none yet gets a new session."""
+async def ensure_session(thread, entry, name=None):
+    """The thread's session id. A thread that has none yet gets a new session,
+    titled from `name` if given, else from the thread's name."""
     if not entry.get("sessionId"):
-        entry["sessionId"] = await agent.create_session(entry["directory"], session_title(thread))
+        title = commands.session_title(name) if name else session_title(thread)
+        entry["sessionId"] = await agent.create_session(entry["directory"], title)
         log.info("thread %s: session %s", thread.id, entry["sessionId"])
         moved = entry.pop("movedFolder", False)
         store.save()
@@ -508,6 +512,29 @@ async def ensure_session(thread, entry):
                 "Earlier context from this thread is not carried over.",
             )
     return entry["sessionId"]
+
+
+async def name_after_first_request(thread, entry, text, author):
+    """Names a thread that was opened empty, and its session, after its first request.
+
+    The session is titled from the new name, not from `thread`, whose name
+    is the placeholder (or missing, for a thread not in discord.py's cache).
+    A rename that fails is logged and the request goes ahead.
+    """
+    entry.pop("placeholderName", None)
+    store.save()
+    name = thread_name(text, author.name)
+    try:
+        await commands.rename_thread(thread, client, name)
+    except Exception as err:
+        log.warning("thread %s: could not rename it after its first request: %s", thread.id, err)
+    if entry.get("sessionId"):  # a /shell or /command ran first
+        try:
+            await agent.rename(entry["sessionId"], entry["directory"], commands.session_title(name))
+        except Exception as err:
+            log.warning("thread %s: could not rename its session: %s", thread.id, err)
+    else:
+        await ensure_session(thread, entry, name)
 
 
 async def live_session(thread, entry):
@@ -790,6 +817,18 @@ async def finish_turn(thread, entry, turn, status, outcome, call=None):
     store.save()
 
 
+async def empty_thread_text(entry):
+    """What a thread opened by an empty mention says first: its settings, and how to go on."""
+    try:
+        settings = commands.describe_settings(await catalog.get(), settings_of(entry))
+    except Exception as err:
+        log.error("could not read the model list for a new thread: %s", err)
+        settings = []
+    lines = ["This thread starts with these settings:", *settings] if settings else []
+    lines.append("Change them with `/model`, `/effort` or `/agent`, then send your question here.")
+    return "\n".join(lines)
+
+
 async def open_thread(channel, name, starter):
     """Opens a thread in `channel` under a new message `starter`. Returns the thread."""
     message = await channel.send(starter, allowed_mentions=NO_MENTIONS)
@@ -883,6 +922,10 @@ async def on_message(message):
             try:
                 files, links = await attachment_parts(message)
                 if await home_of(channel) is not None:
+                    if entry.get("placeholderName"):
+                        await name_after_first_request(
+                            channel, entry, text or message.attachments[0].filename, message.author
+                        )
                     await run_turn(channel, entry, message.author, with_links(text, links), files)
             except Exception as err:
                 await report_failure(channel, err)
@@ -904,13 +947,12 @@ async def on_message(message):
             )
         return
     text = clean_content(message, bot_id)
-    if not text and not message.attachments:
-        await message.reply(
-            "Mention me with a question or a task and I will start a thread for it.", allowed_mentions=NO_MENTIONS
-        )
-        return
-
-    name = thread_name(text or message.attachments[0].filename, message.author.name)
+    empty = not text and not message.attachments
+    if empty:
+        # A thread to set up first: it is named after its first request.
+        name = f"New thread by {message.author.display_name}"[:90]
+    else:
+        name = thread_name(text or message.attachments[0].filename, message.author.name)
     try:
         thread = await message.create_thread(name=name, auto_archive_duration=1440)
     except discord.HTTPException as err:
@@ -918,6 +960,11 @@ async def on_message(message):
         return
 
     entry = register_thread(thread, message.author)
+    if empty:
+        entry["placeholderName"] = True
+        store.save()
+        await send(thread, await empty_thread_text(entry))
+        return
 
     async def new_request():
         try:

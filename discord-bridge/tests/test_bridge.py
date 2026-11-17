@@ -35,6 +35,7 @@ class Agent:
         self.missing = set()  # sessions the agent has forgotten
         self.prompts = []
         self.created = []
+        self.renamed = []
         self.aborted = []
         self.rejected = []
         self.on_abort = None
@@ -45,6 +46,9 @@ class Agent:
     async def create_session(self, directory, title):
         self.created.append(title)
         return self.session_id
+
+    async def rename(self, session_id, directory, title):
+        self.renamed.append((session_id, title))
 
     async def prompt_async(self, session_id, directory, body):
         if session_id in self.missing:
@@ -476,6 +480,9 @@ class Jobs:
     def stop_point(self):
         return 0
 
+    def stopped(self, thread_id):
+        return False
+
 
 @pytest.fixture
 def server(world, monkeypatch):
@@ -496,6 +503,69 @@ def test_a_mention_in_an_enabled_channel_opens_a_thread(server):
     asyncio.run(bridge.on_message(message))
     assert [thread.name for thread in message.threads] == ["fix the login bug"]
     assert "700" in bridge.store.threads and [tid for tid, _ in bridge.queue.submitted] == [700]
+
+
+def test_a_mention_with_only_attachments_still_starts_a_request(server):
+    message = Message(Channel(CHANNEL), "")
+    message.attachments = [types.SimpleNamespace(filename="crash.log")]
+    asyncio.run(bridge.on_message(message))
+    assert [thread.name for thread in message.threads] == ["crash.log"]
+    assert [tid for tid, _ in bridge.queue.submitted] == [700] and "placeholderName" not in bridge.store.threads["700"]
+
+
+def test_an_empty_mention_opens_a_thread_to_set_up_first(server):
+    bridge.store.defaults = {"effort": "max"}
+    message = Message(Channel(CHANNEL), "")
+    asyncio.run(bridge.on_message(message))
+    (thread,) = message.threads
+    assert thread.name == "New thread by Erich" and message.replies == []
+    entry = bridge.store.threads["700"]
+    assert entry["sessionId"] is None and entry["placeholderName"] is True and entry["effort"] == "max"
+    assert bridge.queue.submitted == [] and server.agent.created == []
+    assert thread.texts() == [
+        "This thread starts with these settings:\n"
+        "**Model:** DeepSeek Flash (`deepseek-proxy/deepseek-flash`, the default)\n"
+        "**Effort:** max\n"
+        "**Agent:** build (the default)\n"
+        "Change them with `/model`, `/effort` or `/agent`, then send your question here."
+    ]
+
+
+def first_message(server, text):
+    """Sends `text` in the world's thread, as its first request, and runs it."""
+    asyncio.run(bridge.on_message(Message(server.thread, text, mention=False)))
+    ((_, job),) = bridge.queue.submitted
+    asyncio.run(job())
+
+
+def test_the_first_request_in_an_empty_thread_names_it_and_its_session(server):
+    session = play(server, "tools")
+    server.entry.update(placeholderName=True, effort="max")  # chosen while the thread was empty
+    server.thread.name = "New thread by Erich"
+    first_message(server, "Fix the login bug\nIt fails on Safari.")
+    assert server.thread.name == "Fix the login bug"
+    assert server.agent.created == ["Discord: Fix the login bug"] and server.agent.renamed == []
+    ((sent_to, body),) = server.agent.prompts
+    assert sent_to == session and body["variant"] == "max"
+    assert "placeholderName" not in server.entry and server.thread.texts()[-1] == "done."
+
+
+def test_an_empty_thread_whose_session_exists_already_renames_it_too(server):
+    session = play(server, "tools")
+    server.entry.update(placeholderName=True, sessionId=session)  # a /shell ran first
+    first_message(server, "Fix the login bug")
+    assert server.thread.name == "Fix the login bug"
+    assert server.agent.created == [] and server.agent.renamed == [(session, "Discord: Fix the login bug")]
+
+
+def test_a_failed_rename_does_not_stop_the_first_request(server):
+    play(server, "tools")
+    server.entry["placeholderName"] = True
+    server.thread.name = "New thread by Erich"
+    server.thread.fail_edit = discord.HTTPException(types.SimpleNamespace(status=429, reason="slow down"), "rate limited")
+    first_message(server, "Fix the login bug")
+    assert server.thread.name == "New thread by Erich" and server.agent.created == ["Discord: Fix the login bug"]
+    assert len(server.agent.prompts) == 1 and "placeholderName" not in server.entry
 
 
 def test_a_mention_anywhere_else_is_ignored(server):
