@@ -485,7 +485,7 @@ def setup(tree, ctx):
             f"**Start:** mention me in {where} with a question or a task. I open a thread, "
             "and every later message in it continues the same session. Mention me with nothing else to open "
             "an empty thread you can set up before you ask. Text files you attach are sent "
-            "to the agent as their content.\n\n"
+            "to the agent as their content. Start a message with `//` to keep it from the agent.\n\n"
             "**Settings**\n"
             "`/model` choose the model\n"
             "`/effort` choose how hard the model thinks\n"

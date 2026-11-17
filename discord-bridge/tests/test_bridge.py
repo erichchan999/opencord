@@ -459,10 +459,14 @@ class Message:
         self.role_mentions = []
         self.attachments = []
         self.replies = []
+        self.reactions = []
         self.threads = []
 
     async def reply(self, text, *, allowed_mentions=None):
         self.replies.append(text)
+
+    async def add_reaction(self, emoji):
+        self.reactions.append(emoji)
 
     async def create_thread(self, *, name, auto_archive_duration):
         thread = Channel(700, name)
@@ -566,6 +570,39 @@ def test_a_failed_rename_does_not_stop_the_first_request(server):
     first_message(server, "Fix the login bug")
     assert server.thread.name == "New thread by Erich" and server.agent.created == ["Discord: Fix the login bug"]
     assert len(server.agent.prompts) == 1 and "placeholderName" not in server.entry
+
+
+def test_a_message_starting_with_the_skip_prefix_is_left_alone(server, monkeypatch):
+    with_file = Message(server.thread, "//  have a look at this", mention=False)
+    with_file.attachments = [types.SimpleNamespace(filename="shot.png")]
+    for message in (Message(server.thread, "// lunch?", mention=False), with_file):
+        asyncio.run(bridge.on_message(message))
+    assert bridge.queue.submitted == [] and server.thread.sent == []
+
+    # Not an answer to the agent's question, and no "the agent is waiting" notice either.
+    answered = []
+
+    async def answer_from_message(message, text):
+        answered.append(text)
+        return True
+
+    monkeypatch.setattr(bridge.questions, "open_for", lambda thread_id: ["que_1"])
+    monkeypatch.setattr(bridge.questions, "answer_from_message", answer_from_message)
+    asyncio.run(bridge.on_message(Message(server.thread, "//which one do we pick?", mention=False)))
+    assert answered == [] and server.thread.sent == [] and bridge.queue.submitted == []
+    asyncio.run(bridge.on_message(Message(server.thread, "the second", mention=False)))
+    assert answered == ["the second"]
+
+
+def test_a_skip_prefix_anywhere_but_the_start_is_still_forwarded(server):
+    asyncio.run(bridge.on_message(Message(server.thread, "see https://example.com/a//b", mention=False)))
+    assert [tid for tid, _ in bridge.queue.submitted] == [THREAD]
+
+
+def test_the_skip_prefix_does_not_apply_to_a_new_request(server):
+    message = Message(Channel(CHANNEL), "// fix the login bug")
+    asyncio.run(bridge.on_message(message))
+    assert len(message.threads) == 1 and [tid for tid, _ in bridge.queue.submitted] == [700]
 
 
 def test_a_mention_anywhere_else_is_ignored(server):

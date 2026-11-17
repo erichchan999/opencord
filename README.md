@@ -70,6 +70,7 @@ The bridge and the proxy each read only their own file in `secrets/`, so neither
 - **Attachments:** text files go to the agent as their content, up to 100 KB each. Other files are passed as links.
 - **Questions:** the agent's questions appear with buttons. Anyone in the thread can answer, and the request's time limit is paused meanwhile.
 - **Stop:** `!stop` or `/stop` stops the running request and drops the thread's waiting messages.
+- **Side chat:** a message in a thread that starts with `//` is ignored, so people can talk there without the agent picking it up.
 - **About the system:** the agent can answer questions about opencord itself from its copy of this repo.
 
 A request is stopped, and the thread told, when it hits one of these limits, set in `secrets/bridge.env`:

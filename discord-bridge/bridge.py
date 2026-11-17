@@ -8,6 +8,8 @@
 - Any later message in that thread continues the same session, for as long
   as the thread's parent channel stays enabled.
 - Threads run in parallel, up to MAX_CONCURRENT at once.
+- A message in a thread that starts with "//" is left for the people there:
+  the agent never sees it.
 - "!stop" in a thread aborts the running request and drops that thread's
   queued ones. A request is also stopped when it works longer than
   PROMPT_TIMEOUT_SECONDS, shows no activity for PROMPT_SILENCE_SECONDS, or
@@ -877,6 +879,9 @@ command_buttons = commands.setup(
 # Messages people write. System messages (thread renames, pins, joins) are
 # ignored, since some carry text that would otherwise be sent as a prompt.
 USER_MESSAGE_TYPES = (discord.MessageType.default, discord.MessageType.reply)
+# A message in one of the bridge's threads that starts with this is left alone:
+# not sent to the agent, not taken as an answer, attachments or not.
+SKIP_PREFIX = "//"
 
 
 @client.event
@@ -894,6 +899,8 @@ async def on_message(message):
     # make it inside their queued job, and the thread's messages keep their order.
     entry = store.threads.get(str(channel.id))
     if entry is not None:
+        if message.content.lstrip().startswith(SKIP_PREFIX):
+            return  # said to the people in the thread, not to the agent
         text = clean_content(message, bot_id)
         if not text and not message.attachments:
             return
