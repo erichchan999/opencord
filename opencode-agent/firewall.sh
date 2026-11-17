@@ -4,8 +4,8 @@
 # so nothing the agent runs can change these rules afterwards.
 #
 # Policy: the open internet is allowed. Every private, link-local and
-# loopback-style range is rejected, which covers the Windows host and WSL
-# (including its DNS relay), the Docker gateways, your home LAN,
+# loopback-style range is rejected, which covers the host machine (and on
+# Docker Desktop its VM and DNS relay), the Docker gateways, your LAN,
 # and the other containers. The only private destinations allowed are the
 # ones listed in ALLOW_INTERNAL (host:port pairs), i.e. the llm-proxy, on
 # that port across the internal network it shares with the agent.

@@ -1,20 +1,20 @@
-# fx-never-sleeps Discord sandbox.
+# opencord: a Discord front end to OpenCode.
 #
 #   discord-bridge  - Discord bot. Holds the bot token. Talks to the agent's API.
 #   opencode-agent  - OpenCode server + the repo. Users effectively own this one.
 #   llm-proxy       - Holds the DeepSeek key and forwards model calls.
 #
-# Nothing from Windows is mounted. Each secret is passed only to the container
+# Nothing from the host is mounted. Each secret is passed only to the container
 # that needs it (env_file per service). The agent's egress firewall blocks the
-# Windows host, your LAN and the other containers except the proxy.
+# host, your LAN and the other containers except the proxy.
 
-name: fx-sandbox
+name: opencord
 
 x-hardening: &hardening
-  # The commit start.ps1 deployed, shown by `.\start.ps1 -Status` and in
-  # Docker Desktop. "-dirty" means it had uncommitted changes.
+  # The commit start.sh / start.ps1 deployed, shown by their status command and
+  # in Docker Desktop. "-dirty" means it had uncommitted changes.
   labels:
-    fx.revision: "${FX_REVISION:-unknown}"
+    opencord.revision: "${OPENCORD_REVISION:-unknown}"
   cap_drop: [ALL]
   security_opt: ["no-new-privileges:true"]
   restart: unless-stopped
@@ -38,7 +38,14 @@ services:
 
   opencode-agent:
     <<: *hardening
-    build: ./opencode-agent
+    # Built from the whole folder so the image can carry a read-only copy of
+    # it at /opt/opencord, for questions about this system. The root
+    # .dockerignore keeps secrets/ out.
+    build:
+      context: .
+      dockerfile: opencode-agent/Dockerfile
+      args:
+        REVISION: "${OPENCORD_REVISION:-unknown}"
     env_file: [./secrets/agent.env, ./secrets/shared.env]
     environment:
       ALLOW_INTERNAL: "llm-proxy:8080"
@@ -47,8 +54,8 @@ services:
     cap_add: [NET_ADMIN, NET_RAW, SETUID, SETGID, SETPCAP]
     sysctls:
       net.ipv6.conf.all.disable_ipv6: "1"
-    # Public resolvers: Docker Desktop's default upstream DNS sits in a private
-    # range, which the egress firewall blocks.
+    # Public resolvers: Docker's default upstream DNS often sits in a private
+    # range (Docker Desktop's always does), which the egress firewall blocks.
     dns: [1.1.1.1, 9.9.9.9]
     networks:
       agent-egress: { gw_priority: 10 }

@@ -1,93 +1,109 @@
-# fx-never-sleeps Discord sandbox
+# opencord
 
-Discord users @mention a bot in one channel. Each request gets its own Discord thread and its own OpenCode session, running on DeepSeek. The agent can read and change the `fx-never-sleeps` repo, run shell commands, use the open web and open PRs. Slash commands set each thread's model, thinking effort and agent, and add session tools such as undo, diff and fork.
-
-Everything runs as three Docker containers on Docker Desktop, in the `fx-sandbox` compose project. Nothing from Windows is mounted into them.
+opencord is a Discord front end to [OpenCode](https://opencode.ai). @mention the bot in its channel and it opens a thread with its own OpenCode session, which works on a GitHub repo of your choice: reading and changing code, running commands and opening pull requests. Slash commands control each thread's model, effort and session. Everything runs in Docker, with DeepSeek as the model provider.
 
 ## How it fits together
 
 | Container | Holds | Does |
 | --- | --- | --- |
-| `discord-bridge` | Discord bot token | Watches one channel, opens threads, and passes messages and slash commands to the agent's API. Follows the agent's event stream for live progress and questions. |
-| `opencode-agent` | Scoped GitHub token | Runs `opencode serve` in a clone of the repo. Anyone in the channel effectively controls this container. |
+| `discord-bridge` | Discord bot token | Watches the channels the bot has been added to, opens threads, and passes messages and slash commands to the agent's API. Follows the agent's event stream for live progress and questions. |
+| `opencode-agent` | Scoped GitHub token | Runs `opencode serve` in a clone of the repo. Anyone in the bot's channel effectively controls this container. |
 | `llm-proxy` | DeepSeek API key | Forwards only chat completions and the model list to DeepSeek, adds the real key, and limits the agent to 240 requests a minute. |
 
-Each container reads its own file in `secrets/`, so none of them sees another's keys. The one shared value is the OpenCode server password in `shared.env`, which the bridge uses to call the agent.
+The containers run in the `opencord` compose project. Each one reads its own file in `secrets/`, so none of them sees another's keys. The one shared value is the OpenCode server password in `shared.env`, which the bridge uses to call the agent.
 
-State lives in three volumes, which survive `-Stop` and redeploys: `work` (the repo clone), `agent-data` (OpenCode sessions) and `bridge-data` (thread map, per-thread settings and open questions).
+State lives in three volumes, which survive stopping and redeploying: `work` (the repo clone), `agent-data` (OpenCode sessions) and `bridge-data` (thread map, per-thread settings and open questions).
 
 | Path | What it is |
 | --- | --- |
 | `compose.yaml` | The containers, networks, volumes and resource limits |
-| `start.ps1` | Deploy, status, logs and stop |
+| `start.sh`, `start.ps1` | Deploy, status, logs and stop, on macOS/Linux and on Windows |
 | `discord-bridge/` | The bot, with its tests. Python 3.13, discord.py and aiohttp. |
 | `llm-proxy/` | The proxy that holds the DeepSeek key. Python standard library only. |
-| `opencode-agent/` | Agent image (OpenCode pinned to 1.19.5), egress firewall, startup scripts and `opencode.json` |
+| `opencode-agent/` | Agent image (OpenCode pinned to 1.19.5), egress firewall, startup scripts, `opencode.json`, and `system-prompt.md`, which tells the agent about this system |
 | `secrets.example/` | One env file per container with placeholders. Real values go in `secrets/`, which git ignores. |
 
 ### Isolation
 
-- **Windows:** no Windows folder is mounted into any container. The images are built from this folder, but only the files each Dockerfile copies end up inside.
-- **Network:** the agent's firewall is set up as root at startup, before the agent drops to the `node` user with no capabilities. It blocks every private range, which covers the Windows host, your LAN and the other containers. The only private destination it allows is port 8080 on the network the agent shares with the proxy. The open internet is allowed.
+- **Host files:** nothing from the host is mounted into any container. The agent image carries a read-only copy of this folder at `/opt/opencord`, so the agent can answer questions about the system. `.dockerignore` keeps `secrets/` out of it, and the build fails if `secrets/` ever gets in.
+- **Network:** the agent's firewall is set up as root at startup, before the agent drops to the `node` user with no capabilities. It blocks every private range, which covers the host, your LAN and the other containers. The only private destination it allows is port 8080 on the network the agent shares with the proxy. The open internet is allowed.
 - **Internal networks:** `bridge-net` (bridge ↔ agent) and `llm-net` (agent ↔ proxy) have no route outside.
 - **Limits:** every container has CPU, memory and process limits, drops all capabilities and sets `no-new-privileges`. The bridge and proxy have read-only root filesystems.
 
-The remaining risk is a container escape or a Linux kernel exploit. Docker Desktop's VM can reach your Windows files (it shares them for bind mounts), and all WSL distros share one VM kernel, so an escape could reach `C:`. In Docker Desktop's settings, keep "Expose daemon on tcp://localhost:2375 without TLS" turned off.
+The remaining risk is a container escape or a Linux kernel exploit. Docker Desktop (Windows, macOS) runs containers in a VM that can reach the host folders it shares. Docker Engine on Linux shares the host's kernel. Either way, an escape could reach your files.
 
 ## Setup
 
-1. **Docker Desktop:** install it with the WSL 2 backend. In Settings → General, turn on "Start Docker Desktop when you sign in", so the bot comes back after a reboot. The containers restart on their own once Docker is up.
+1. **Docker and git:** install Docker with Compose v2: Docker Desktop on Windows or macOS, or Docker Engine with the compose plugin on Linux. Have Docker start at boot so the bot comes back after a reboot. On Docker Desktop that's Settings → General → "Start Docker Desktop when you sign in". On Linux, run `sudo systemctl enable docker`. The containers restart on their own once Docker is up. On Windows, also see [Windows](#windows).
 
 2. **Secrets:** copy the examples, then fill in each file.
 
-   ```powershell
-   Copy-Item -Recurse secrets.example secrets
+   ```bash
+   cp -r secrets.example secrets
    ```
 
    | File | Set |
    | --- | --- |
-   | `secrets/proxy.env` | `DEEPSEEK_API_KEY` |
-   | `secrets/agent.env` | `GH_TOKEN` (step 3). Change `REPO` (`owner/name`) to use a different repo. |
-   | `secrets/bridge.env` | `DISCORD_BOT_TOKEN` and `DISCORD_CHANNEL_ID` (step 5). Optionally `MAX_CONCURRENT` (default 16) and the time limits under [Using it](#using-it). |
-   | `secrets/shared.env` | `OPENCODE_SERVER_PASSWORD`, any long random string |
+   | `secrets/proxy.env` | `DEEPSEEK_API_KEY`, from platform.deepseek.com |
+   | `secrets/agent.env` | `REPO`, the repo the agent works on, as `owner/name`, and `GH_TOKEN` (step 3) |
+   | `secrets/bridge.env` | `DISCORD_BOT_TOKEN` (step 5). Optionally `MAX_CONCURRENT` (default 16) and the time limits under [Using it](#using-it). |
+   | `secrets/shared.env` | `OPENCODE_SERVER_PASSWORD`, any long random string, such as the output of `openssl rand -hex 32` |
 
-   One way to make the password:
-
-   ```powershell
-   $b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); -join ($b | ForEach-Object { $_.ToString('x2') })
-   ```
-
-3. **GitHub token:** create a fine-grained personal access token with access to `fx-never-sleeps` only, Contents and Pull requests set to read and write, and no other permissions. Leaving out Workflows means nobody can add Actions workflows.
+3. **GitHub token:** see [GitHub token](#github-token).
 
 4. **Protect `main`:** in the repo, add a ruleset on `main` that requires a pull request with your approval and blocks force pushes and deletion.
 
-5. **Discord bot:** in the Developer Portal, turn Message Content Intent on and Public Bot off. Invite the bot with this link:
+5. **Discord bot:** see [Discord bot](#discord-bot).
+
+6. **Start it:** run `./start.sh`. It warns about any secret that's still a placeholder, then builds the images and starts the containers. In the log (`./start.sh --logs`), look for `working in #<channel>`, which also names any missing permissions, followed by `slash commands ready: ...`. A warning that starts `I can also read` means a category was missed in step 6 of [Discord bot](#discord-bot).
+
+### GitHub token
+
+The agent pushes and opens pull requests with a fine-grained personal access token that can reach only the one repo.
+
+1. On GitHub, click your profile picture → **Settings** → **Developer settings** → **Personal access tokens** → **Fine-grained tokens** → **Generate new token**.
+2. **Token name:** for example `opencord`. **Expiration:** your choice. When it runs out, the agent can't push or open pull requests until you make a new token, put it in `secrets/agent.env` and run the start script again.
+3. **Resource owner:** the account or organization that owns the repo in `REPO`. An organization may have to allow fine-grained tokens, or approve this one, before it works.
+4. **Repository access:** choose **Only select repositories** and pick that repo.
+5. **Permissions:** under Repository permissions, set **Contents** and **Pull requests** to **Read and write**. GitHub adds **Metadata** (read-only) itself. Leave everything else at **No access**. Without **Workflows**, nobody can add or change GitHub Actions workflows through the agent.
+6. Click **Generate token**, copy it, and set it as `GH_TOKEN` in `secrets/agent.env`.
+
+### Discord bot
+
+The bot works only in channels whose own permissions name it, and in the threads it opens there. Discord settings also keep it out of every other channel, so it never sees their messages.
+
+1. **Create the app:** in the [Developer Portal](https://discord.com/developers/applications), click **New Application** and give it a name. That name is what people @mention.
+2. **Installation** page: under Installation Contexts, untick **User Install**, leaving **Guild Install**. Set **Install Link** to **None** and save. Discord won't let you turn off Public Bot while an install link is set.
+3. **Bot** page:
+   - Turn **Public Bot** off, so only you can add the bot to a server.
+   - Under Privileged Gateway Intents, turn **Message Content Intent** on. The bot needs it to read the messages in its threads that don't mention it.
+   - Save, then click **Reset Token**. Copy the token and set it as `DISCORD_BOT_TOKEN` in `secrets/bridge.env`.
+4. **Invite it:** copy the **Application ID** from the General Information page, put it in this link and open it. You need the Manage Server permission in the server.
 
    ```
-   https://discord.com/oauth2/authorize?client_id=<application id>&scope=bot&permissions=309237746752
+   https://discord.com/oauth2/authorize?client_id=<application id>&scope=bot&permissions=309237745728
    ```
 
-   It grants View Channel, Send Messages, Read Message History, Create Public Threads, Send Messages in Threads, Add Reactions and Attach Files. The `bot` scope also covers the slash commands.
-
-   To get the channel ID, turn on Developer Mode in Discord, right-click the channel and choose Copy Channel ID.
-
-6. **Start it:** run `.\start.ps1`. It warns about any secret that's still a placeholder, then builds the images and starts the containers. In the bridge log, look for `watching #<channel>`, which also names any missing permissions, followed by `slash commands ready: ...`.
+   Discord gives the bot a role with its name, with Send Messages, Read Message History, Create Public Threads, Send Messages in Threads, Add Reactions and Attach Files. The link leaves out View Channel: the bot sees only the channel you add it to next. The `bot` scope also covers the slash commands.
+5. **Add it to its channel:** open the channel's settings → **Permissions** → **Advanced permissions**, add the bot's role, and allow View Channel, Send Messages, Send Messages in Threads, Create Public Threads, Read Message History, Add Reactions and Attach Files. Set this on the channel, not its category, or the bot works in every channel synced to that category.
+6. **Keep it out of everything else:** a bot sees every channel @everyone can, and no role setting can take that away. Only a deny on the channel or category can. For every category, open its settings → **Permissions**, add the bot's role and deny View Channel. Channels synced to a category follow it, and the bot's own channel keeps its allow from step 5. Do the same for every channel that isn't in a category or isn't synced with its category. Whenever you add a category or channel later, deny the bot there too. If you miss one, the bot reads that channel's messages but ignores them.
+7. **Limit the slash commands:** Discord shows the bot's commands in every channel by default. In **Server Settings** → **Integrations** → the bot → **Manage**, under Channels, turn off **All Channels** and add the bot's channel. Its threads follow it. The bot refuses commands from other channels anyway; this hides them there.
 
 ## Running it
 
-```powershell
-.\start.ps1           # build and (re)start everything; run it again after editing any file here
-.\start.ps1 -Status   # container state, and which commit each container runs
-.\start.ps1 -Logs     # follow the logs
-.\start.ps1 -Stop     # stop the containers (volumes are kept)
+```bash
+./start.sh            # build and (re)start everything; run it again after editing any file here
+./start.sh --status   # container state, and which commit each container runs
+./start.sh --logs     # follow the logs
+./start.sh --stop     # stop the containers (volumes are kept)
 ```
 
-Each deploy labels every container `fx.revision` with this folder's commit, plus `-dirty` if there were uncommitted changes. `-Status` compares it with the folder's current commit in its `UpToDate` column. Docker Desktop shows the same label on each container under the `fx-sandbox` project, along with its logs and resource use.
+Each deploy labels every container `opencord.revision` with this folder's commit, plus `-dirty` if there were uncommitted changes. The status command compares it with the folder's current commit. Docker Desktop shows the same label on each container under the `opencord` project, along with its logs and resource use.
 
 ## Using it
 
-- **New request:** @mention the bot in the channel. It opens a thread with a new OpenCode session.
-- **Follow-ups:** any message in that thread continues the same session. Only threads under `DISCORD_CHANNEL_ID` count, so moving the bot to another channel leaves its old threads silent.
+- **New request:** @mention the bot in its channel. It opens a thread with a new OpenCode session.
+- **Follow-ups:** any message in that thread continues the same session. Taking the bot out of a channel silences its threads there.
 - **One checkout:** every thread works in the same clone, `/work/repo`. Two threads editing the same files at the same time can collide. The bridge makes no branches, so ask the agent for one when a change needs it.
 - **Parallel threads:** up to `MAX_CONCURRENT` threads run at once, and further requests wait in a queue. Within a thread, messages run one at a time, in order.
 - **Attachments:** text files go to the agent as their content, up to 100 KB each and 200 KB per message. Other files, such as images, and larger ones are passed as links the agent can try to fetch.
@@ -95,6 +111,7 @@ Each deploy labels every container `fx.revision` with this folder's commit, plus
 - **Questions:** each question from the agent appears with a button per option (or a menu) and "Type an answer". Anyone in the thread can answer. When only one question is open, a plain message in the thread counts as the answer. The request waits for every answer, and its time limit is paused meanwhile.
 - **Stop:** `!stop` or `/stop` aborts the running request, dismisses its questions and drops that thread's queued messages.
 - **Restarts:** if the bridge restarts, a running request is picked back up and open questions keep their buttons. Messages waiting in a queue are lost. If the agent container restarts, its running requests end.
+- **About the system:** ask the agent how the bot, its commands or its limits work. It reads its copy of this repo, as deployed, to answer.
 - **Mentions:** the bot never pings anyone, whatever the agent writes.
 
 A request is stopped, and the thread is told, when it hits one of these limits. Each one can be changed in `secrets/bridge.env`.
@@ -108,7 +125,7 @@ A request is stopped, and the thread is told, when it hits one of these limits. 
 
 ### Slash commands
 
-Anyone who can post in the channel can use them. Changes are announced in the thread. `/status`, `/todo`, `/help` and the `/undo` confirmation are shown only to the person who used them.
+Anyone who can post in the bot's channel can use them. Changes are announced in the thread. `/status`, `/todo`, `/help` and the `/undo` confirmation are shown only to the person who used them.
 
 | Command | What it does |
 | --- | --- |
@@ -130,7 +147,7 @@ Anyone who can post in the channel can use them. Changes are announced in the th
 | `/command` | Run one of the agent's own commands or skills, such as `review` |
 | `/help` | List the commands |
 
-- **In the main channel**, `/model`, `/effort` and `/agent` set what new threads start with, and `/status` shows those defaults. A new thread copies the defaults when it opens, so later changes leave existing threads alone. The other commands work only inside a thread.
+- **In the main channel** (outside any thread), `/model`, `/effort` and `/agent` set what new threads start with, and `/status` shows those defaults. A new thread copies the defaults when it opens, so later changes leave existing threads alone. The other commands work only inside a thread.
 - **`default`** as the value puts a setting back on the agent's own config.
 - **While a request runs**, a settings change applies from the next message. `/compact`, `/fork`, `/shell` and `/command` wait their turn like a message would. `/undo` and `/redo` refuse.
 - **`/undo` and the shared checkout:** undo puts the request's files back as they were before it. If another thread has changed those files since, its changes to them are lost too. The confirmation warns about this.
@@ -144,10 +161,32 @@ The models, the default and the effort levels all come from `opencode-agent/open
 
 ## Tests
 
-The bridge's unit tests run inside a Docker build, so nothing needs installing on Windows. The build fails if a test fails.
+The bridge's unit tests run inside a Docker build, so nothing needs installing on the host. The build fails if a test fails.
 
-```powershell
-docker build --target test --progress plain -t fx-sandbox-bridge-test discord-bridge
+```bash
+docker build --target test --progress plain -t opencord-bridge-test discord-bridge
 ```
 
 They cover the bridge with stand-ins for Discord and the agent. The agent stand-in replays event streams recorded from a real OpenCode 1.19.5 server, kept in `discord-bridge/tests/fixtures/`. The live Discord side (buttons, file uploads, thread renames) is only checked by hand.
+
+## Windows
+
+- **Docker Desktop:** install it with the WSL 2 backend. In Settings → General, turn on "Start Docker Desktop when you sign in", and keep "Expose daemon on tcp://localhost:2375 without TLS" turned off.
+- **Commands:** use `start.ps1` in PowerShell in place of `start.sh`.
+
+  ```powershell
+  Copy-Item -Recurse secrets.example secrets
+  .\start.ps1           # build and (re)start everything
+  .\start.ps1 -Status   # container state, and which commit each container runs
+  .\start.ps1 -Logs     # follow the logs
+  .\start.ps1 -Stop     # stop the containers (volumes are kept)
+  ```
+
+  If PowerShell says running scripts is disabled, run `powershell -ExecutionPolicy Bypass -File .\start.ps1` instead.
+- **Password:** without `openssl`, this makes one for `shared.env`:
+
+  ```powershell
+  $b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); -join ($b | ForEach-Object { $_.ToString('x2') })
+  ```
+
+- **Isolation:** Docker Desktop's VM can reach your Windows files, which it shares for bind mounts, and all WSL distros share its kernel. A container escape could therefore reach `C:`.

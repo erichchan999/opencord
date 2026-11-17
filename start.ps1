@@ -1,12 +1,13 @@
-# fx-never-sleeps Discord sandbox - runs on Docker Desktop.
+# opencord - build, deploy and manage the containers on Windows (Docker Desktop).
 #
 #   .\start.ps1           build and (re)start everything from this folder
 #   .\start.ps1 -Status   show container status and which commit each one runs
 #   .\start.ps1 -Logs     follow the logs (Ctrl+C to stop following)
 #   .\start.ps1 -Stop     stop the containers (volumes and the repo clone are kept)
 #
-# Docker Desktop's dashboard shows the same containers under the "fx-sandbox"
-# project, with their logs, stats and an "fx.revision" label naming the commit.
+# start.sh does the same on macOS and Linux.
+# Docker Desktop's dashboard shows the same containers under the "opencord"
+# project, with their logs, stats and an "opencord.revision" label naming the commit.
 param([switch]$Status, [switch]$Logs, [switch]$Stop)
 
 # Native tools (docker, git) write progress to stderr; Windows PowerShell 5.1
@@ -38,7 +39,7 @@ if ($Status) {
     $local = Get-Revision
     $containers = & docker inspect $ids | Out-String | ConvertFrom-Json
     $containers | ForEach-Object {
-        $deployed = $_.Config.Labels.'fx.revision'
+        $deployed = $_.Config.Labels.'opencord.revision'
         [pscustomobject]@{
             Service  = $_.Config.Labels.'com.docker.compose.service'
             State    = if ($_.State.Health) { "$($_.State.Status) ($($_.State.Health.Status))" } else { $_.State.Status }
@@ -57,7 +58,7 @@ if ($Stop) { Invoke-Compose stop; exit }
 $required = @{
     'secrets\proxy.env'  = @('DEEPSEEK_API_KEY')
     'secrets\agent.env'  = @('REPO', 'GH_TOKEN')
-    'secrets\bridge.env' = @('DISCORD_BOT_TOKEN', 'DISCORD_CHANNEL_ID')
+    'secrets\bridge.env' = @('DISCORD_BOT_TOKEN')
     'secrets\shared.env' = @('OPENCODE_SERVER_PASSWORD')
 }
 foreach ($file in $required.Keys) {
@@ -71,9 +72,9 @@ foreach ($file in $required.Keys) {
     }
 }
 
-# compose.yaml puts this on every container as the "fx.revision" label. A new
+# compose.yaml puts this on every container as the "opencord.revision" label. A new
 # value recreates the containers, so the label always names what is running.
-$env:FX_REVISION = Get-Revision
-Write-Host "Building and starting containers at $env:FX_REVISION ..."
+$env:OPENCORD_REVISION = Get-Revision
+Write-Host "Building and starting containers at $env:OPENCORD_REVISION ..."
 Invoke-Compose up -d --build --remove-orphans
 Invoke-Compose ps

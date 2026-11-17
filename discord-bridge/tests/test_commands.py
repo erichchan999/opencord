@@ -12,9 +12,10 @@ from fakes import Channel, Interaction
 from sample import FLASH, PRO, snapshot
 from state import Store
 
-CHANNEL = 500  # the watched channel
+CHANNEL = 500  # a channel the bot has been added to
 THREAD = 600  # a thread the bridge opened in it
-ELSEWHERE = 999
+STRANGER = 650  # a thread in it the bridge did not open
+ELSEWHERE = 999  # a channel the bot has not been added to
 
 
 class Queue:
@@ -112,11 +113,12 @@ class Harness:
         self.posted_to = []  # (channel id, text)
         self.files = []  # (file name, bytes) posted with them
         self.commands_run = []
-        self.opened = []  # (name, starter text) of threads opened
+        self.opened = []  # (channel id, name, starter text) of threads opened
         self.tree = app_commands.CommandTree(discord.Client(intents=discord.Intents.none()))
+        self.home = Channel(CHANNEL, "agent")
 
-        async def thread_parent_id(channel):
-            return CHANNEL if channel.id in (THREAD, 700) else None
+        async def home_of(channel):
+            return self.home if channel.id in (CHANNEL, THREAD, STRANGER, 700) else None
 
         async def stop_thread(thread_id, entry, stop_point):
             self.stopped.append((thread_id, stop_point))
@@ -142,17 +144,17 @@ class Harness:
 
         self.open_fails = None
 
-        async def open_thread(name, starter):
+        async def open_thread(channel, name, starter):
             if self.open_fails:
                 raise self.open_fails
-            self.opened.append((name, starter))
+            self.opened.append((channel.id, name, starter))
             return Channel(700, name)
 
         self.on_component = commands.setup(
             self.tree,
             commands.Context(
-                store=self.store, agent=self.agent, catalog=Catalog(), queue=self.queue, channel_id=CHANNEL,
-                compact_timeout=5, shell_timeout=600, thread_parent_id=thread_parent_id, stop_thread=stop_thread,
+                store=self.store, agent=self.agent, catalog=Catalog(), queue=self.queue,
+                compact_timeout=5, shell_timeout=600, home_of=home_of, stop_thread=stop_thread,
                 send=send, report_failure=report_failure, keep_typing=keep_typing, ensure_session=ensure_session,
                 run_command=run_command, open_thread=open_thread,
             ),
@@ -256,13 +258,20 @@ THREAD_COMMANDS = [
 ]
 
 
-def test_commands_do_nothing_outside_the_channel_and_its_threads(tmp_path):
+def test_commands_do_nothing_outside_the_channels_and_threads_the_bot_works_in(tmp_path):
     h = Harness(tmp_path)
     everywhere = [("model", {"name": PRO}), ("effort", {"level": "max"}), ("agent", {"name": "plan"}), ("status", {})]
-    for command, arguments in everywhere + THREAD_COMMANDS:
-        text, private = only_reply(h.run(command, ELSEWHERE, **arguments))
-        assert private and f"<#{CHANNEL}>" in text, command
+    for place in (ELSEWHERE, STRANGER):
+        for command, arguments in everywhere + THREAD_COMMANDS:
+            text, private = only_reply(h.run(command, place, **arguments))
+            assert private and "channels I've been added to" in text, (place, command)
     assert h.store.defaults == {} and h.stopped == [] and h.queue.jobs == [] and h.agent.calls == []
+
+
+def test_help_points_to_the_channel_it_is_used_under(tmp_path):
+    h = Harness(tmp_path)
+    assert f"mention me in <#{CHANNEL}>" in only_reply(h.run("help", THREAD))[0]
+    assert "mention me in a channel I've been added to" in only_reply(h.run("help", ELSEWHERE))[0]
 
 
 def test_thread_only_commands_say_so_in_the_main_channel(tmp_path):
@@ -669,7 +678,7 @@ def test_fork_opens_a_thread_with_a_copy_of_the_session(tmp_path):
     assert text == "Forking this thread." and not private
     h.queue.run_all()
     assert h.agent.calls[0] == ("fork", "ses_1", None)
-    assert h.opened == [("Fix the login bug (fork)", f"🍴 **Tester** forked <#{THREAD}> into a new thread.")]
+    assert h.opened == [(CHANNEL, "Fix the login bug (fork)", f"🍴 **Tester** forked <#{THREAD}> into a new thread.")]
     copy = h.saved().threads["700"]
     assert copy["sessionId"] == "ses_fork" and copy["model"] == PRO and copy["agent"] == "plan" and "effort" not in copy
     assert ("rename", "ses_fork", "Discord: Fix the login bug (fork)") in h.agent.calls

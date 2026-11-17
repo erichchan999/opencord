@@ -1,11 +1,11 @@
-"""discord-bridge: connects one Discord channel to the OpenCode server.
+"""discord-bridge: connects Discord to the OpenCode server.
 
-- @mention the bot in DISCORD_CHANNEL_ID -> it opens a thread with its own
-  OpenCode session and answers there. Every session works in the shared clone
-  (BASE_DIR); the agent can make branches or worktrees itself if asked.
-- Any later message in that thread continues the same session. Only threads
-  under DISCORD_CHANNEL_ID count, so threads left in a previously configured
-  channel are ignored.
+- @mention the bot in a channel it has been added to (access.py) -> it opens
+  a thread with its own OpenCode session and answers there. Every session
+  works in the shared clone (BASE_DIR); the agent can make branches or
+  worktrees itself if asked.
+- Any later message in that thread continues the same session, for as long
+  as the bot stays added to the thread's channel.
 - Threads run in parallel, up to MAX_CONCURRENT at once.
 - "!stop" in a thread aborts the running request and drops that thread's
   queued ones. A request is also stopped when it works longer than
@@ -45,6 +45,7 @@ from collections import Counter
 import discord
 from discord import app_commands
 
+import access
 import commands
 import events
 from catalog import Catalog, model_key
@@ -68,7 +69,6 @@ def env(name, default=None):
 
 
 TOKEN = env("DISCORD_BOT_TOKEN")
-CHANNEL_ID = int(env("DISCORD_CHANNEL_ID"))
 OPENCODE_URL = env("OPENCODE_URL", "http://opencode-agent:4096")
 OPENCODE_PASSWORD = env("OPENCODE_SERVER_PASSWORD")
 STATE_FILE = os.environ.get("STATE_FILE", "/data/threads.json")
@@ -331,14 +331,19 @@ def register_thread(thread, author):
     return entry
 
 
-async def thread_parent_id(thread):
-    # A thread missing from discord.py's cache arrives as a PartialMessageable
-    # with no parent, so ask Discord. None (unknown) counts as not ours.
-    parent_id = getattr(thread, "parent_id", None)
-    if parent_id is None:
-        with contextlib.suppress(discord.HTTPException):
-            parent_id = getattr(await client.fetch_channel(thread.id), "parent_id", None)
-    return parent_id
+async def home_of(channel):
+    """The text channel the bot works under for `channel`: the channel itself, or
+    a thread's parent. None when the bot has not been added there (access.py)."""
+    if not isinstance(channel, (discord.Thread, discord.abc.GuildChannel)):
+        # Missing from discord.py's cache (a PartialMessageable), so ask Discord.
+        # Unknown counts as not added.
+        found = client.get_channel(channel.id)
+        if found is None:
+            with contextlib.suppress(discord.HTTPException):
+                found = await client.fetch_channel(channel.id)
+        channel = found
+    home = channel.parent if isinstance(channel, discord.Thread) else channel
+    return home if isinstance(home, discord.TextChannel) and access.added_here(home) else None
 
 
 def channel_for(thread_id):
@@ -709,9 +714,8 @@ async def finish_turn(thread, entry, turn, status, outcome, call=None):
     store.save()
 
 
-async def open_thread(name, starter):
-    """Opens a thread in the watched channel under a new message `starter`. Returns the thread."""
-    channel = client.get_channel(CHANNEL_ID) or await client.fetch_channel(CHANNEL_ID)
+async def open_thread(channel, name, starter):
+    """Opens a thread in `channel` under a new message `starter`. Returns the thread."""
     message = await channel.send(starter, allowed_mentions=NO_MENTIONS)
     return await message.create_thread(name=name[:100], auto_archive_duration=1440)
 
@@ -741,10 +745,9 @@ command_buttons = commands.setup(
         agent=agent,
         catalog=catalog,
         queue=queue,
-        channel_id=CHANNEL_ID,
         compact_timeout=COMPACT_TIMEOUT,
         shell_timeout=SHELL_TIMEOUT,
-        thread_parent_id=thread_parent_id,
+        home_of=home_of,
         stop_thread=stop_thread,
         send=send,
         report_failure=report_failure,
@@ -770,9 +773,8 @@ async def on_message(message):
 
     # Follow-ups inside a thread this bridge owns. Looked up by ID rather than
     # channel type, so a thread missing from discord.py's cache still works.
-    # Only threads under the watched channel count, so threads left over from a
-    # previously configured channel stop forwarding messages.
-    # The parent lookup can wait on Discord, so nothing is queued after it:
+    # Only threads in a channel the bot is still added to count.
+    # That lookup can wait on Discord, so nothing is queued after it:
     # follow-ups check it inside their queued job, and "!stop" takes its stop
     # point first. Either way the thread's messages keep their order.
     entry = store.threads.get(str(channel.id))
@@ -782,7 +784,7 @@ async def on_message(message):
             return
         if text == "!stop":
             stop_point = queue.stop_point()
-            if await thread_parent_id(channel) != CHANNEL_ID:
+            if await home_of(channel) is None:
                 return
             await stop_thread(channel.id, entry, stop_point)
             with contextlib.suppress(discord.HTTPException):
@@ -793,7 +795,7 @@ async def on_message(message):
             # The agent is waiting on a person, so a message here is most
             # likely the answer. Queued as a request it would sit behind the
             # very request that is waiting for it.
-            if await thread_parent_id(channel) != CHANNEL_ID:
+            if await home_of(channel) is None:
                 return
             if text and not message.attachments and await questions.answer_from_message(message, text):
                 with contextlib.suppress(discord.HTTPException):
@@ -805,7 +807,7 @@ async def on_message(message):
             )
 
         async def follow_up():
-            if await thread_parent_id(channel) != CHANNEL_ID:
+            if await home_of(channel) is None:
                 return
             try:
                 files, links = await attachment_parts(message)
@@ -816,8 +818,18 @@ async def on_message(message):
         queue.submit(channel.id, follow_up)
         return
 
-    # New requests: @mention in the one allowed channel.
-    if channel.id != CHANNEL_ID or not mentions_bot(message, bot_id):
+    # New requests: an @mention in a channel the bot has been added to.
+    if not mentions_bot(message, bot_id):
+        return
+    home = await home_of(channel)
+    if home is None:
+        return
+    if home.id != channel.id:  # a thread someone else opened
+        with contextlib.suppress(discord.HTTPException):
+            await message.reply(
+                f"I can't start a thread inside a thread. Mention me in <#{home.id}> instead.",
+                allowed_mentions=NO_MENTIONS,
+            )
         return
     text = clean_content(message, bot_id)
     if not text and not message.attachments:
@@ -901,38 +913,72 @@ async def on_ready():
         return
     _ready_once = True
     log.info("logged in as %s", client.user)
-    try:
-        channel = client.get_channel(CHANNEL_ID) or await client.fetch_channel(CHANNEL_ID)
-        perms = channel.permissions_for(channel.guild.me)
-        needed = [
-            "view_channel",
-            "send_messages",
-            "read_message_history",
-            "create_public_threads",
-            "send_messages_in_threads",
-            "add_reactions",
-            "attach_files",
-        ]
-        missing = [name for name in needed if not getattr(perms, name)]
-        log.info("watching #%s%s", channel.name, f"; MISSING permissions: {', '.join(missing)}" if missing else "")
-    except Exception as err:
-        log.error("cannot access channel %s: %s", CHANNEL_ID, err)
-        return
     # Questions asked while the bridge was down have no buttons yet.
     in_background(check_questions())
-    # Registered to this one server, where they show up at once. Commands
+    if not client.guilds:
+        log.warning("not in any server yet. Invite the bot with the link in the README.")
+    for guild in client.guilds:
+        await prepare_server(guild)
+
+
+@client.event
+async def on_guild_join(guild):
+    await prepare_server(guild)
+
+
+async def prepare_server(guild):
+    """Logs where the bot works in `guild` and registers the slash commands there."""
+    added = access.channels_added(guild)
+    if not added:
+        log.warning("%s: not added to any channel yet, so I ignore everything there. See the README.", guild.name)
+    for channel in added:
+        log_working_in(channel)
+    ignored = access.seen_but_not_added(guild)
+    if ignored:
+        log.warning(
+            "%s: I can also read these channels, which I ignore: %s. Deny me View Channel there to keep their messages away (README).",
+            guild.name,
+            ", ".join(f"#{channel.name}" for channel in ignored),
+        )
+    # Registered to each server, where they show up at once. Commands
     # registered globally can take an hour to appear.
     try:
-        tree.copy_global_to(guild=channel.guild)
-        synced = await tree.sync(guild=channel.guild)
-        log.info("slash commands ready: %s", " ".join(f"/{command.name}" for command in synced))
+        tree.copy_global_to(guild=guild)
+        synced = await tree.sync(guild=guild)
+        log.info("%s: slash commands ready: %s", guild.name, " ".join(f"/{command.name}" for command in synced))
     except discord.Forbidden as err:
         log.error(
-            "could not register slash commands: %s. Re-invite the bot with the invite link in the README.",
+            "%s: could not register slash commands: %s. Re-invite the bot with the invite link in the README.",
+            guild.name,
             err,
         )
     except discord.HTTPException as err:
-        log.error("could not register slash commands: %s", err)
+        log.error("%s: could not register slash commands: %s", guild.name, err)
+
+
+def log_working_in(channel):
+    missing = access.missing(channel)
+    shown = f"; MISSING permissions: {', '.join(missing)}" if missing else ""
+    log.info("%s: working in #%s%s", channel.guild.name, channel.name, shown)
+
+
+# Someone adding the bot to a channel, or taking it out, shows in the log
+# without a restart.
+@client.event
+async def on_guild_channel_create(channel):
+    if isinstance(channel, discord.TextChannel) and access.added_here(channel):
+        log_working_in(channel)
+
+
+@client.event
+async def on_guild_channel_update(before, after):
+    if not isinstance(after, discord.TextChannel):
+        return
+    was, now = access.added_here(before), access.added_here(after)
+    if now and not was:
+        log_working_in(after)
+    elif was and not now:
+        log.info("%s: no longer working in #%s", after.guild.name, after.name)
 
 
 async def main():

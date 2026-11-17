@@ -1,8 +1,10 @@
 """Slash commands: the Discord side of OpenCode's session settings and controls.
 
-The commands are registered to the one server the watched channel is in.
+The commands are registered to every server the bot is in, and work only in
+the channels it has been added to (access.py) and the threads it opened there.
 Inside one of the bridge's threads they act on that thread. /model, /effort
-and /agent used in the main channel set what new threads start with.
+and /agent used in the main channel set what new threads start with, in every
+channel the bot works in.
 
 A change is answered publicly, so everyone in the thread sees it. Lookups and
 refusals are shown only to the person who ran the command.
@@ -52,17 +54,16 @@ class Context:
     agent: Any  # opencode.OpenCode
     catalog: Any  # catalog.Catalog
     queue: Any  # bridge.ThreadQueue
-    channel_id: int
     compact_timeout: float
     shell_timeout: float
-    thread_parent_id: Callable  # async (channel) -> parent channel id, or None
+    home_of: Callable  # async (channel) -> the channel the bot works under (itself or a thread's parent), or None
     stop_thread: Callable  # async (thread_id, entry, stop_point)
     send: Callable  # async (channel, text, file=None)
     report_failure: Callable  # async (channel, error)
     keep_typing: Callable  # async (channel), runs until cancelled
     ensure_session: Callable  # async (channel, entry) -> session id, creating or replacing one if needed
     run_command: Callable  # async (channel, entry, name, arguments), follows it like a prompt
-    open_thread: Callable  # async (name, starter text) -> a new thread in the watched channel
+    open_thread: Callable  # async (channel, name, starter text) -> a new thread in that channel
 
 
 def session_title(name):
@@ -341,7 +342,7 @@ async def gather_limited(calls, limit=4):
 
 def setup(tree, ctx):
     """Adds the commands to `tree`."""
-    wrong_place = f"I only work in <#{ctx.channel_id}> and the threads I open there."
+    wrong_place = "I only work in the channels I've been added to and the threads I open there."
     thread_only = "Use this inside one of my threads."
     busy = "I'm working on a request in this thread. Wait for it to finish, or `/stop` it, then try again."
     nothing_to_redo = "There is nothing to redo. `/redo` works after `/undo`, until the next message is sent."
@@ -351,13 +352,17 @@ def setup(tree, ctx):
 
     async def scope_of(interaction):
         """("thread", its entry) in one of the bridge's threads, ("channel", the defaults) in
-        the watched channel, (None, None) anywhere else."""
-        if interaction.channel_id == ctx.channel_id:
+        a channel the bot has been added to, (None, None) anywhere else.
+
+        Discord delivers commands from every channel, even ones the bot cannot
+        see, so this is the gate for them."""
+        home = await ctx.home_of(channel_of(interaction))
+        if home is None:
+            return None, None
+        if home.id == interaction.channel_id:
             return "channel", ctx.store.defaults
         entry = ctx.store.threads.get(str(interaction.channel_id))
-        if entry is not None and await ctx.thread_parent_id(channel_of(interaction)) == ctx.channel_id:
-            return "thread", entry
-        return None, None
+        return ("thread", entry) if entry is not None else (None, None)
 
     async def say(interaction, text, *, private=False):
         await interaction.response.send_message(text, ephemeral=private, allowed_mentions=NO_MENTIONS)
@@ -625,9 +630,11 @@ def setup(tree, ctx):
     @tree.command(name="help", description="List what I can do and the commands I understand.")
     @app_commands.guild_only()
     async def help_(interaction: discord.Interaction):
+        home = await ctx.home_of(channel_of(interaction))
+        where = f"<#{home.id}>" if home is not None else "a channel I've been added to"
         await refuse(
             interaction,
-            f"**Start:** mention me in <#{ctx.channel_id}> with a question or a task. I open a thread, "
+            f"**Start:** mention me in {where} with a question or a task. I open a thread, "
             "and every later message in it continues the same session. Text files you attach are sent "
             "to the agent as their content.\n\n"
             "**Settings**\n"
@@ -837,6 +844,7 @@ def setup(tree, ctx):
         channel, who, user_id = channel_of(interaction), name_of(interaction.user), interaction.user.id
         source_id = interaction.channel_id
         name = fork_name(getattr(channel, "name", None))
+        home = await ctx.home_of(channel)  # the copy opens next to this thread
 
         async def job():
             session_id = entry.get("sessionId")
@@ -848,7 +856,7 @@ def setup(tree, ctx):
                 before = ((session or {}).get("revert") or {}).get("messageID")
                 forked = await ctx.agent.fork(session_id, entry["directory"], before)
                 try:
-                    thread = await ctx.open_thread(name, f"🍴 **{who}** forked <#{source_id}> into a new thread.")
+                    thread = await ctx.open_thread(home, name, f"🍴 **{who}** forked <#{source_id}> into a new thread.")
                 except Exception:
                     # Without its thread nobody can reach the copy.
                     with contextlib.suppress(Exception):

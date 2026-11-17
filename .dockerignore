@@ -1,0 +1,18 @@
+# Only the agent image is built from this folder (see compose.yaml), to carry
+# a read-only copy of it at /opt/opencord. Everything is left out except what
+# is listed here, so a new file with secrets in it never slips in.
+*
+!README.md
+!compose.yaml
+!start.sh
+!start.ps1
+!.gitattributes
+!.gitignore
+!discord-bridge
+!llm-proxy
+!opencode-agent
+!secrets.example
+**/__pycache__
+**/.pytest_cache
+# Never, whatever is listed above.
+secrets

@@ -9,6 +9,7 @@ import time
 import types
 
 import aiohttp
+import discord
 import pytest
 
 import bridge
@@ -17,8 +18,12 @@ from fakes import Channel
 from opencode import OpenCodeError
 from sample import FLASH, messages_from, recorded, root_session, snapshot
 
-THREAD = 600
-AUTHOR = types.SimpleNamespace(name="erich", display_name="Erich")
+CHANNEL = 500  # a channel the bot has been added to
+THREAD = 600  # a thread the bridge opened in it
+STRANGER = 650  # a thread in it the bridge did not open
+ELSEWHERE = 999  # a channel the bot has not been added to
+BOT_ID = 1234
+AUTHOR = types.SimpleNamespace(name="erich", display_name="Erich", id=42, bot=False)
 
 
 class Agent:
@@ -84,6 +89,7 @@ class Catalog:
 class Client:
     def __init__(self, channel):
         self._channel = channel
+        self.user = types.SimpleNamespace(id=BOT_ID)
 
     async def wait_until_ready(self):
         pass
@@ -316,6 +322,87 @@ def test_a_subagents_session_leads_to_its_parents_thread(world):
         assert await bridge.thread_for_session("ses_stranger") is None
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------- where the bot listens
+
+
+class Message:
+    """A message someone posts in `channel`, mentioning the bot unless told otherwise."""
+
+    def __init__(self, channel, text, mention=True):
+        self.author = AUTHOR
+        self.type = discord.MessageType.default
+        self.channel = channel
+        self.guild = None
+        self.content = f"<@{BOT_ID}> {text}" if mention else text
+        self.mentions = [types.SimpleNamespace(id=BOT_ID)] if mention else []
+        self.role_mentions = []
+        self.attachments = []
+        self.replies = []
+        self.threads = []
+
+    async def reply(self, text, *, allowed_mentions=None):
+        self.replies.append(text)
+
+    async def create_thread(self, *, name, auto_archive_duration):
+        thread = Channel(700, name)
+        self.threads.append(thread)
+        return thread
+
+
+class Jobs:
+    def __init__(self):
+        self.submitted = []  # (thread id, job)
+
+    def submit(self, thread_id, job):
+        self.submitted.append((thread_id, job))
+
+    def stop_point(self):
+        return 0
+
+
+@pytest.fixture
+def server(world, monkeypatch):
+    """`world`, plus which channels the bot has been added to (CHANNEL, and with it its threads)."""
+    world.home = Channel(CHANNEL, "agent")
+    world.added = True
+
+    async def home_of(channel):
+        return world.home if world.added and channel.id in (CHANNEL, THREAD, STRANGER) else None
+
+    monkeypatch.setattr(bridge, "home_of", home_of)
+    monkeypatch.setattr(bridge, "queue", Jobs())
+    return world
+
+
+def test_a_mention_in_a_channel_the_bot_was_added_to_opens_a_thread(server):
+    message = Message(Channel(CHANNEL), "fix the login bug")
+    asyncio.run(bridge.on_message(message))
+    assert [thread.name for thread in message.threads] == ["fix the login bug"]
+    assert "700" in bridge.store.threads and [tid for tid, _ in bridge.queue.submitted] == [700]
+
+
+def test_a_mention_anywhere_else_is_ignored(server):
+    for message in (Message(Channel(ELSEWHERE), "hello"), Message(Channel(CHANNEL), "no mention", mention=False)):
+        asyncio.run(bridge.on_message(message))
+        assert message.threads == [] and message.replies == []
+    assert bridge.queue.submitted == [] and list(bridge.store.threads) == [str(THREAD)]
+
+
+def test_a_mention_in_someone_elses_thread_points_back_to_the_channel(server):
+    message = Message(Channel(STRANGER), "help")
+    asyncio.run(bridge.on_message(message))
+    assert message.replies == [f"I can't start a thread inside a thread. Mention me in <#{CHANNEL}> instead."]
+    assert message.threads == [] and bridge.queue.submitted == []
+
+
+def test_a_thread_goes_quiet_once_the_bot_is_taken_out_of_its_channel(server):
+    server.added = False
+    asyncio.run(bridge.on_message(Message(server.thread, "still there?", mention=False)))
+    ((_, job),) = bridge.queue.submitted  # queued, so it keeps its place, and checked when it runs
+    asyncio.run(job())
+    assert server.agent.prompts == [] and server.thread.sent == []
 
 
 # ---------------------------------------------------------------- /command

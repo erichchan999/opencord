@@ -5,8 +5,8 @@ set -eu
 
 : "${REPO:?Set REPO=owner/name in secrets/agent.env}"
 
-git config --global user.name "${GIT_AUTHOR_NAME:-fx-sandbox}"
-git config --global user.email "${GIT_AUTHOR_EMAIL:-fx-sandbox@users.noreply.github.com}"
+git config --global user.name "${GIT_AUTHOR_NAME:-opencord}"
+git config --global user.email "${GIT_AUTHOR_EMAIL:-opencord@users.noreply.github.com}"
 git config --global init.defaultBranch main
 
 case "${GH_TOKEN:-}" in
