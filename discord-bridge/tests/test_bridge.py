@@ -8,6 +8,7 @@ import asyncio
 import time
 import types
 
+import aiohttp
 import pytest
 
 import bridge
@@ -54,6 +55,11 @@ class Agent:
         for event in self.stream:
             bridge.router.dispatch(event)
         return self.command_answer
+
+    async def session(self, session_id, directory):
+        if session_id in self.missing:
+            raise OpenCodeError(f"session {session_id} not found", 404)
+        return {"id": session_id}
 
     async def statuses(self, directory):
         return self.working
@@ -342,6 +348,15 @@ def test_a_command_is_followed_like_a_prompt_and_answers_with_its_own_reply(worl
     assert "turn" not in world.entry and bridge.router.turns == {}
 
 
+def test_a_command_in_a_thread_whose_session_was_lost_starts_a_fresh_one(world):
+    world.entry["sessionId"] = "ses_forgotten"
+    world.agent.missing = {"ses_forgotten"}
+    world.agent.command_answer = {"info": {"role": "assistant"}, "parts": [{"type": "text", "text": "Reviewed."}]}
+    asyncio.run(asyncio.wait_for(bridge.run_command(world.thread, world.entry, "review", ""), 2))
+    assert world.entry["sessionId"] == "ses_new" and [sid for sid, _ in world.agent.commands_sent] == ["ses_new"]
+    assert "started a fresh session" in world.thread.texts()[0] and world.thread.texts()[-1] == "Reviewed."
+
+
 def test_a_command_the_agent_refuses_reports_the_error_and_not_an_older_reply(world):
     world.agent.command_fails = OpenCodeError("POST /session/ses_new/command -> 500: boom", 500)
     world.agent.messages = OLD_EXCHANGE
@@ -354,16 +369,19 @@ def test_a_command_the_agent_refuses_reports_the_error_and_not_an_older_reply(wo
 
 
 class Attachment:
-    def __init__(self, filename, data, content_type=None, size=None):
+    def __init__(self, filename, data, content_type=None, size=None, fails=None):
         self.filename = filename
         self.content_type = content_type
         self.size = len(data) if size is None else size
         self.url = f"https://cdn.example/{filename}"
         self._data = data
+        self._fails = fails
         self.reads = 0
 
     async def read(self):
         self.reads += 1
+        if self._fails:
+            raise self._fails
         return self._data
 
 
@@ -376,17 +394,35 @@ def test_text_attachments_are_sent_as_their_content_and_the_rest_as_links():
         Attachment("big.log", b"x", "text/plain", size=bridge.TEXT_ATTACHMENT_LIMIT + 1),
         Attachment("binary.txt", b"\xff\xfe\x01", "text/plain"),
         Attachment("nul.txt", b"a\x00b", "text/plain"),
+        Attachment("flaky.txt", b"", "text/plain", fails=aiohttp.ClientConnectionError("connection reset")),
     ]
     parts, links = asyncio.run(bridge.attachment_parts(types.SimpleNamespace(attachments=files)))
     assert [part["filename"] for part in parts] == ["notes.txt", "calc.py", "data.json"]
     assert parts[0] == {"type": "file", "mime": "text/plain", "filename": "notes.txt", "url": "data:text/plain;base64,aGVsbG8="}
     assert all(part["mime"] == "text/plain" for part in parts)  # the agent refuses application/json
-    assert links == [f"{name}: https://cdn.example/{name}" for name in ("shot.png", "big.log", "binary.txt", "nul.txt")]
+    names = ("shot.png", "big.log", "binary.txt", "nul.txt", "flaky.txt")
+    assert links == [f"{name}: https://cdn.example/{name}" for name in names]
     assert files[3].reads == files[4].reads == 0  # not downloaded at all
 
     assert bridge.with_links("look", []) == "look"
     assert bridge.with_links("look", links[:1]) == "look\n\n(Attached files, fetch them if needed:\nshot.png: https://cdn.example/shot.png)"
     assert bridge.with_links("", links[:1]).startswith("(Attached files")
+
+
+def test_text_files_known_by_name_are_read_too():
+    files = [Attachment("Dockerfile", b"FROM python:3.13\n"), Attachment(".gitignore", b"*.pyc\n"), Attachment("NOTES", b"x")]
+    parts, links = asyncio.run(bridge.attachment_parts(types.SimpleNamespace(attachments=files)))
+    assert [part["filename"] for part in parts] == ["Dockerfile", ".gitignore"]
+    assert links == ["NOTES: https://cdn.example/NOTES"]  # no type, no suffix and no known name
+
+
+def test_a_messages_text_files_share_one_size_budget():
+    size = 90_000
+    files = [Attachment(f"part{n}.log", b"x" * size, "text/plain") for n in range(3)] + [Attachment("small.txt", b"ok", "text/plain")]
+    parts, links = asyncio.run(bridge.attachment_parts(types.SimpleNamespace(attachments=files)))
+    # 2 x 90 KB fit in 200 KB, the third does not, the small one still does.
+    assert [part["filename"] for part in parts] == ["part0.log", "part1.log", "small.txt"]
+    assert links == ["part2.log: https://cdn.example/part2.log"] and files[2].reads == 0
 
 
 def test_files_go_out_with_the_prompt(world):

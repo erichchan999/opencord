@@ -81,6 +81,9 @@ class Agent:
     async def rename(self, session_id, directory, title):
         self.calls.append(("rename", session_id, title))
 
+    async def delete_session(self, session_id, directory):
+        self.calls.append(("delete", session_id))
+
     async def shell(self, session_id, directory, agent, command, timeout, model=None):
         self.calls.append(("shell", session_id, agent, command, model))
         if self.shell_fails:
@@ -137,7 +140,11 @@ class Harness:
         async def run_command(channel, entry, name, arguments):
             self.commands_run.append((channel.id, entry["sessionId"], name, arguments))
 
+        self.open_fails = None
+
         async def open_thread(name, starter):
+            if self.open_fails:
+                raise self.open_fails
             self.opened.append((name, starter))
             return Channel(700, name)
 
@@ -360,6 +367,16 @@ def test_compact_waits_its_turn_and_uses_the_threads_model(tmp_path):
     asyncio.run(job())
     assert h.agent.summarized == [("ses_1", split_model(PRO))]
     assert h.posted == ["Compacted. Earlier messages are now a summary."]
+
+
+def test_compact_uses_the_model_chosen_while_it_waited(tmp_path):
+    h = Harness(tmp_path)
+    h.entry["sessionId"] = "ses_1"
+    h.queue.busy = 1
+    h.run("compact")
+    h.entry["model"] = PRO  # someone runs /model before the compaction gets its turn
+    h.queue.run_all()
+    assert h.agent.summarized == [("ses_1", split_model(PRO))]
 
 
 def test_compact_queued_before_new_finds_nothing_to_do(tmp_path):
@@ -670,6 +687,16 @@ def test_fork_after_an_undo_leaves_the_undone_part_behind(tmp_path):
     assert h.agent.calls[0] == ("fork", "ses_1", "msg_3")
 
 
+def test_a_fork_whose_thread_cannot_open_removes_the_copy(tmp_path):
+    h = Harness(tmp_path)
+    h.entry["sessionId"] = "ses_1"
+    h.open_fails = discord.Forbidden(type("R", (), {"status": 403, "reason": "no"})(), "Missing Permissions")
+    h.run("fork")
+    h.queue.run_all()
+    assert h.agent.calls == [("fork", "ses_1", None), ("delete", "ses_fork")]
+    assert list(h.store.threads) == [str(THREAD)] and h.posted[0].startswith("failed: ")
+
+
 def test_fork_name():
     assert commands.fork_name("Fix it") == "Fix it (fork)"
     assert commands.fork_name("Fix it (fork)") == "Fix it (fork)"
@@ -724,12 +751,22 @@ def test_shell_failures(tmp_path):
     h.run("shell", command="sleep 9999")
     h.queue.run_all()
     assert h.agent.calls[-1] == ("abort", "ses_new")
-    assert h.posted[-1] == "The command was still running after 10 minutes, so I stopped it."
+    assert h.posted[-1] == "The command was still running after 10m 00s, so I stopped it."
 
 
 def test_shell_output_cannot_close_its_code_block():
     text, full = commands.shell_message("before ``` after")
-    assert text == "```\nbefore `​`` after\n```" and full is None
+    assert text == "```\nbefore `​`​` after\n```" and full is None
+    for run in ("````", "``````", "`` ``"):
+        inner = commands.shell_message(run)[0].removeprefix("```\n").removesuffix("\n```")
+        assert "``" not in inner, run
+
+
+def test_long_shell_output_made_of_fences_still_fits_one_message():
+    output = "```\n" * 2000
+    text, full = commands.shell_message(output)
+    assert len(text) <= 1900 and full == output.rstrip()
+    assert "``" not in text.removeprefix("```\n").split("\n```\n-#")[0]
 
 
 def test_command_runs_one_of_the_agents_commands(tmp_path):

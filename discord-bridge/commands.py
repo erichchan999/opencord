@@ -24,17 +24,16 @@ from typing import Any, Callable
 import discord
 from discord import app_commands
 
-from catalog import DEFAULT_WORD
+from catalog import DEFAULT_WORD, model_key
 from events import is_request, parts_text, request_text, tool_detail
 from state import SETTINGS, set_setting, settings_of
-from status import format_tokens, plain, plural, todo_lines
+from status import MESSAGE_LIMIT, format_duration, format_tokens, plain, plural, todo_lines
 
 log = logging.getLogger("bridge")
 
 NO_MENTIONS = discord.AllowedMentions.none()
 # How many of a session's latest messages /status reads to find the last reply.
 STATUS_MESSAGES = 20
-MESSAGE_LIMIT = 1900
 # Largest file posted to Discord, which takes up to 10 MB from a bot.
 FILE_LIMIT = 8_000_000
 # Custom ids of the buttons these commands show start with this.
@@ -61,7 +60,7 @@ class Context:
     send: Callable  # async (channel, text, file=None)
     report_failure: Callable  # async (channel, error)
     keep_typing: Callable  # async (channel), runs until cancelled
-    ensure_session: Callable  # async (channel, entry) -> session id, creating one if needed
+    ensure_session: Callable  # async (channel, entry) -> session id, creating or replacing one if needed
     run_command: Callable  # async (channel, entry, name, arguments), follows it like a prompt
     open_thread: Callable  # async (name, starter text) -> a new thread in the watched channel
 
@@ -91,7 +90,7 @@ def describe_settings(snapshot, settings):
     """Lines for /status: what these settings mean right now."""
     options, _ = snapshot.resolve(settings)
     if "model" in options:
-        key = f"{options['model']['providerID']}/{options['model']['modelID']}"
+        key = model_key(options["model"])
         own = settings.get("model") == key
         model = f"{snapshot.model_name(key)} (`{key}`{'' if own else ', the default'})"
     else:
@@ -113,14 +112,14 @@ def matching_choices(pairs, typed):
     ][:25]
 
 
-def quoted(text):
-    """Something a person typed, made safe to show back to them."""
-    return discord.utils.escape_markdown(text.strip()[:80])
-
-
 def snippet(text, limit=100):
     """Text from the conversation as one short line that cannot break a message's formatting."""
     return discord.utils.escape_markdown(plain(text, limit))
+
+
+def quoted(text):
+    """Something a person typed, made safe to show back to them."""
+    return snippet(text, 80)
 
 
 def name_of(user):
@@ -134,8 +133,9 @@ def file_of(data, filename):
     return discord.File(io.BytesIO(data), filename=filename)
 
 
-def code_block(text):
-    return "```\n" + text.replace("```", "`​``") + "\n```"
+def unfenced(text):
+    """Text that cannot end a code block: no two backticks are left side by side."""
+    return re.sub(r"`(?=`)", "`​", text)
 
 
 # ---------------------------------------------------------------- reading a session
@@ -286,13 +286,14 @@ def shell_message(output, limit=MESSAGE_LIMIT - 100):
     output = output.rstrip()
     if not output:
         return "-# The command printed nothing.", None
-    block = code_block(output)
-    if len(block) <= limit:
-        return block, None
+    # Made safe before it is measured and cut, since that makes it longer.
+    safe = unfenced(output)
+    if len(safe) + 8 <= limit:
+        return f"```\n{safe}\n```", None
     # The end of the output usually says how it went.
-    tail = output[-(limit - 100) :]
+    tail = safe[-(limit - 100) :]
     tail = tail[tail.find("\n") + 1 :] if "\n" in tail else tail
-    return code_block("…\n" + tail) + "\n-# The end of the output. All of it is attached.", output
+    return f"```\n…\n{tail}\n```\n-# The end of the output. All of it is attached.", output
 
 
 def undo_question(target, changes):
@@ -378,14 +379,11 @@ def setup(tree, ctx):
     def later(interaction, channel):
         """Answers a deferred command from a queued job. Posts in the channel if the answer is too late."""
 
-        async def answer(text, file=None):
+        async def answer(text):
             try:
-                if file is None:
-                    await interaction.followup.send(text, allowed_mentions=NO_MENTIONS)
-                else:
-                    await interaction.followup.send(text, file=file, allowed_mentions=NO_MENTIONS)
+                await interaction.followup.send(text, allowed_mentions=NO_MENTIONS)
             except discord.HTTPException:
-                await ctx.send(channel, text, file)
+                await ctx.send(channel, text)
 
         return answer
 
@@ -700,16 +698,23 @@ def setup(tree, ctx):
             return
         if not entry.get("sessionId"):
             return await refuse(interaction, "There is nothing to compact yet.")
-        snapshot = await ctx.catalog.get()
-        model = snapshot.resolve(settings_of(entry))[0].get("model")
-        if model is None:
-            return await refuse(interaction, "I can't tell which model to summarise with. Pick one with `/model` first.")
+        no_model = "I can't tell which model to summarise with. Pick one with `/model` first."
+
+        async def model_now():
+            return (await ctx.catalog.get()).resolve(settings_of(entry))[0].get("model")
+
+        if await model_now() is None:
+            return await refuse(interaction, no_model)
         channel = channel_of(interaction)
 
         async def job():
             session_id = entry.get("sessionId")  # read here: /new may have run while this waited
             if not session_id:
                 return await ctx.send(channel, "There is nothing to compact: this thread has a fresh session.")
+            # Also read here: /model may have changed while this waited.
+            model = await model_now()
+            if model is None:
+                return await ctx.send(channel, no_model)
             typing = asyncio.create_task(ctx.keep_typing(channel))
             try:
                 await ctx.agent.summarize(session_id, entry["directory"], model, ctx.compact_timeout)
@@ -842,7 +847,13 @@ def setup(tree, ctx):
                 # Requests taken back with /undo stay behind.
                 before = ((session or {}).get("revert") or {}).get("messageID")
                 forked = await ctx.agent.fork(session_id, entry["directory"], before)
-                thread = await ctx.open_thread(name, f"🍴 **{who}** forked <#{source_id}> into a new thread.")
+                try:
+                    thread = await ctx.open_thread(name, f"🍴 **{who}** forked <#{source_id}> into a new thread.")
+                except Exception:
+                    # Without its thread nobody can reach the copy.
+                    with contextlib.suppress(Exception):
+                        await ctx.agent.delete_session(forked["id"], entry["directory"])
+                    raise
                 copy = ctx.store.register_thread(thread.id, user_id)
                 for setting in SETTINGS:
                     set_setting(copy, setting, entry.get(setting))
@@ -885,7 +896,8 @@ def setup(tree, ctx):
             await asyncio.wait_for(thread.edit(name=name), RENAME_WAIT)
         except TimeoutError:
             return await interaction.followup.send(
-                "Discord allows only two renames of a thread every ten minutes. Try again in a few minutes.",
+                "Discord did not rename the thread within 10 seconds, so I gave up. It allows only two renames "
+                "of a thread every ten minutes, which is the usual reason. Try again in a few minutes.",
                 allowed_mentions=NO_MENTIONS,
             )
         except discord.HTTPException as err:
@@ -935,8 +947,8 @@ def setup(tree, ctx):
                 if session_id:
                     with contextlib.suppress(Exception):
                         await ctx.agent.abort(session_id, entry["directory"])
-                minutes = round(ctx.shell_timeout / 60)
-                await ctx.send(channel, f"The command was still running after {minutes} minutes, so I stopped it.")
+                took = format_duration(ctx.shell_timeout)
+                await ctx.send(channel, f"The command was still running after {took}, so I stopped it.")
             except Exception as err:
                 await ctx.report_failure(channel, err)
             finally:

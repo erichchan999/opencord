@@ -45,12 +45,12 @@ from discord import app_commands
 
 import commands
 import events
-from catalog import Catalog
+from catalog import Catalog, model_key
 from events import Router, parts_text, turn_reply, wait_for_turn
 from opencode import OpenCode, OpenCodeError
 from questions import Questions
 from state import Store, set_setting, settings_of
-from status import StatusMessage, format_duration, render_finished, render_working
+from status import MESSAGE_LIMIT, StatusMessage, format_duration, render_finished, render_working
 
 logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s", stream=sys.stdout)
 logging.getLogger("discord").setLevel(logging.WARNING)
@@ -84,12 +84,14 @@ COMPACT_TIMEOUT = 300
 # Longest a /shell command may run.
 SHELL_TIMEOUT = float(os.environ.get("SHELL_TIMEOUT_SECONDS", "600"))
 # Text files attached to a message are sent to the agent as their content, up
-# to this size each. Bigger files, and files that are not text, are passed as a
-# link instead.
+# to this size each and the second size for all of a message's files together,
+# which keeps them well inside the model's context. Files past either limit,
+# and files that are not text, are passed as a link instead.
 TEXT_ATTACHMENT_LIMIT = 100_000
+TEXT_ATTACHMENTS_TOTAL = 200_000
 # How many of a session's latest messages are read to find the reply to a request.
 REPLY_MESSAGES = 50
-DISCORD_LIMIT = 1900
+DISCORD_LIMIT = MESSAGE_LIMIT
 
 NO_MENTIONS = discord.AllowedMentions.none()
 agent = OpenCode(OPENCODE_URL, OPENCODE_PASSWORD)
@@ -235,44 +237,59 @@ TEXT_SUFFIXES = {
     ".java", ".kt", ".go", ".rs", ".rb", ".php", ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".swift", ".sh",
     ".bash", ".ps1", ".sql", ".diff", ".patch", ".dockerfile", ".gradle", ".lua", ".r", ".vue", ".svelte",
 }
+# Text files known by their whole name, which have no suffix to go by.
+TEXT_NAMES = {
+    "dockerfile", "makefile", "justfile", "procfile", "gemfile", "readme", "license", "changelog",
+    ".env", ".gitignore", ".gitattributes", ".dockerignore", ".editorconfig", ".npmrc", ".prettierrc", ".eslintrc",
+}
 
 
 def looks_like_text(attachment):
     kind = (attachment.content_type or "").split(";")[0].strip().lower()
-    suffix = os.path.splitext(attachment.filename or "")[1].lower()
-    return kind.startswith("text/") or kind in TEXT_TYPES or suffix in TEXT_SUFFIXES
+    name = (attachment.filename or "").lower()
+    suffix = os.path.splitext(name)[1]  # empty for ".env" or "Dockerfile"
+    return kind.startswith("text/") or kind in TEXT_TYPES or suffix in TEXT_SUFFIXES or name in TEXT_NAMES
+
+
+async def attachment_part(attachment):
+    """The file part for a text attachment, or None to pass it as a link."""
+    try:
+        data = await attachment.read()
+        if "\x00" in data.decode("utf-8"):
+            return None  # not text after all
+    except Exception as err:  # a failed download, or not UTF-8: the link still works
+        log.info("attachment %s is passed as a link: %s", attachment.filename, err)
+        return None
+    return {
+        # Sent as plain text whatever the file is: the agent turns text/plain
+        # into file content, but refuses some other text types.
+        "type": "file",
+        "mime": "text/plain",
+        "filename": attachment.filename,
+        "url": "data:text/plain;base64," + base64.b64encode(data).decode("ascii"),
+    }
 
 
 async def attachment_parts(message):
     """(file parts, links) for a message's attachments.
 
-    Text files up to TEXT_ATTACHMENT_LIMIT become file parts, which the agent
+    Text files within the size limits become file parts, which the agent
     reads as their content. Every other attachment is listed as a link.
     """
+    # Chosen from the sizes Discord reports, in order, before anything is downloaded.
+    chosen, budget = [], TEXT_ATTACHMENTS_TOTAL
+    for attachment in message.attachments:
+        if looks_like_text(attachment) and attachment.size <= min(TEXT_ATTACHMENT_LIMIT, budget):
+            budget -= attachment.size
+            chosen.append(attachment)
+    found = dict(zip(map(id, chosen), await asyncio.gather(*(attachment_part(a) for a in chosen))))
     parts, links = [], []
     for attachment in message.attachments:
-        data = None
-        if looks_like_text(attachment) and attachment.size <= TEXT_ATTACHMENT_LIMIT:
-            try:
-                data = await attachment.read()
-                if "\x00" in data.decode("utf-8"):
-                    data = None  # not text after all
-            except (discord.HTTPException, UnicodeDecodeError) as err:
-                log.info("attachment %s is passed as a link: %s", attachment.filename, err)
-                data = None
-        if data is None:
+        part = found.get(id(attachment))
+        if part is None:
             links.append(f"{attachment.filename}: {attachment.url}")
-            continue
-        parts.append(
-            {
-                # Sent as plain text whatever the file is: the agent turns
-                # text/plain into file content, but refuses some other text types.
-                "type": "file",
-                "mime": "text/plain",
-                "filename": attachment.filename,
-                "url": "data:text/plain;base64," + base64.b64encode(data).decode("ascii"),
-            }
-        )
+        else:
+            parts.append(part)
     return parts, links
 
 
@@ -406,7 +423,7 @@ async def prompt_settings(thread, entry):
         )
     label = []
     if "model" in options:
-        label.append(snapshot.model_name(f"{options['model']['providerID']}/{options['model']['modelID']}"))
+        label.append(snapshot.model_name(model_key(options["model"])))
     if "variant" in options:
         label.append(f"effort {options['variant']}")
     if "agent" in options:
@@ -427,6 +444,31 @@ async def ensure_session(thread, entry):
                 "This thread now works in the shared checkout, so I started a fresh session. "
                 "Earlier context from this thread is not carried over.",
             )
+    return entry["sessionId"]
+
+
+async def live_session(thread, entry):
+    """Like ensure_session, and also replaces a session the agent no longer has.
+
+    For /command and /shell, whose calls cannot start over by themselves.
+    run_turn recovers from a lost session on its own, without this extra call.
+    """
+    session_id = await ensure_session(thread, entry)
+    try:
+        await agent.session(session_id, entry["directory"])
+    except OpenCodeError as err:
+        if err.status != 404:
+            raise
+        await replace_session(thread, entry)
+    return entry["sessionId"]
+
+
+async def replace_session(thread, entry):
+    """Starts a new session for a thread whose session the agent no longer has
+    (its data volume was reset, say), and tells the thread."""
+    entry["sessionId"] = await agent.create_session(entry["directory"], session_title(thread))
+    store.save()
+    await send(thread, "My earlier context for this thread was lost, so I started a fresh session.")
     return entry["sessionId"]
 
 
@@ -461,11 +503,8 @@ async def run_turn(thread, entry, author, text, files=()):
         except OpenCodeError as err:
             if err.status != 404:
                 raise
-            # Session disappeared (e.g. agent data volume was reset): start a new one.
             router.finish(turn)
-            entry["sessionId"] = await agent.create_session(entry["directory"], session_title(thread))
-            store.save()
-            await send(thread, "My earlier context for this thread was lost, so I started a fresh session.")
+            await replace_session(thread, entry)
             turn = router.start(entry["sessionId"], thread.id)
             await agent.prompt_async(entry["sessionId"], entry["directory"], body)
         await follow_turn(thread, entry, turn, label, time.time())
@@ -491,11 +530,11 @@ def command_ended(turn, call):
 async def run_command(thread, entry, name, arguments):
     """Runs one of the agent's slash commands and follows the work like a prompt's."""
     log.info("thread %s: /%s (%d chars of arguments)", thread.id, name, len(arguments))
-    session_id = await ensure_session(thread, entry)
+    session_id = await live_session(thread, entry)
     options, label = await prompt_settings(thread, entry)
     body = {"command": name, "arguments": arguments}
     if "model" in options:
-        body["model"] = f"{options['model']['providerID']}/{options['model']['modelID']}"
+        body["model"] = model_key(options["model"])
     if "variant" in options:
         body["variant"] = options["variant"]
     if "agent" in options:
@@ -708,7 +747,7 @@ command_buttons = commands.setup(
         send=send,
         report_failure=report_failure,
         keep_typing=keep_typing,
-        ensure_session=ensure_session,
+        ensure_session=live_session,
         run_command=run_command,
         open_thread=open_thread,
     ),

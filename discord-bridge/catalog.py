@@ -61,6 +61,11 @@ def split_model(key):
     return {"providerID": provider_id, "modelID": model_id}
 
 
+def model_key(model):
+    """The inverse of split_model: {"providerID", "modelID"} -> "<provider>/<model>"."""
+    return f"{model['providerID']}/{model['modelID']}"
+
+
 @dataclass
 class Snapshot:
     models: dict = field(default_factory=dict)
@@ -139,12 +144,21 @@ class Catalog:
         self._fetched_at = 0.0
         self._refreshing = None
 
+    async def _commands(self):
+        # Only /command uses this list, so a failure here must not cost every
+        # prompt its model and effort.
+        try:
+            return await self._agent.commands(self._directory)
+        except Exception as err:
+            log.error("could not read the agent's commands: %s", err)
+            return []
+
     async def _fetch(self):
         providers, config, agents, commands = await asyncio.gather(
             self._agent.providers(self._directory),
             self._agent.config(self._directory),
             self._agent.agents(self._directory),
-            self._agent.commands(self._directory),
+            self._commands(),
         )
         models = parse_models(providers or {})
         default_model = (config or {}).get("model")

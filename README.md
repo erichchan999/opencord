@@ -105,7 +105,7 @@ Each deploy stamps every container with an `fx.revision` label: the commit this 
 - **New request:** @mention the bot in the channel. It opens a thread with a new OpenCode session working in `/work/repo`.
 - **Branches:** the bridge doesn't create branches or worktrees. Ask the agent for one if a change needs it.
 - **Follow-ups:** any message in that thread continues the same session. Only threads under `DISCORD_CHANNEL_ID` count: if you move the bot to another channel, its old threads stop responding.
-- **Attachments:** text files attached to a message (source code, logs, Markdown, JSON and so on, up to 100 KB each) are sent to the agent as their content. Other files, such as images, and bigger ones are passed as a link the agent can try to fetch.
+- **Attachments:** text files attached to a message (source code, logs, Markdown, JSON, a `Dockerfile` and so on, up to 100 KB each and 200 KB for all of a message's files) are sent to the agent as their content. Other files, such as images, and bigger ones are passed as a link the agent can try to fetch.
 - **Parallel threads:** up to `MAX_CONCURRENT` (16) threads run at once, and further requests wait in a queue. All sessions share one checkout, so two threads editing the same files at the same time can collide.
 - **Progress:** while the agent works, one status message in the thread shows the tool call in progress and the agent's todo list. It is edited in place, at most every two seconds, and ends as a single line with the time taken, the number of tool calls and the size of the context. The answer follows as a normal message.
 - **Questions:** when the agent asks something, each question appears as a message with a button per option, or a menu when there are many or several can be picked, plus "Type an answer". Anyone in the thread can answer. If exactly one question is open, a plain message in the thread is taken as its answer. The request waits, and its time limit is paused, until every question has an answer.
@@ -146,7 +146,7 @@ Anyone who can post in the channel can use them. A change is announced in the th
 | `/command` | Run one of the agent's own commands or skills, with autocomplete, such as `review` or `init`. Followed with a status message like any request. | |
 | `/help` | List the commands | List the commands |
 
-Typing `default` as the value puts a setting back on the agent's own config. A change made while a request is running applies from the next message. `/compact`, `/fork`, `/shell`, `/command` and `/redo` wait for the request in progress, like a message would. `/undo` and `/redo` refuse while a request is running.
+Typing `default` as the value puts a setting back on the agent's own config. A change made while a request is running applies from the next message. `/compact`, `/fork`, `/shell` and `/command` wait for the request in progress, like a message would. `/undo` and `/redo` refuse while a request is running.
 
 `/undo` restores the files the request changed to how they were before it. Every thread works in the same checkout, so if another thread changed those files since, its changes to them are lost too. The confirmation says so.
 

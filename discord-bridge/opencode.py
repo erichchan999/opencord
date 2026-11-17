@@ -136,6 +136,9 @@ class OpenCode:
     async def todos(self, session_id, directory):
         return await self.request("GET", f"/session/{session_id}/todo", directory=directory, timeout=10) or []
 
+    async def delete_session(self, session_id, directory):
+        await self.request("DELETE", f"/session/{session_id}", directory=directory, timeout=30)
+
     async def rename(self, session_id, directory, title):
         await self.request("PATCH", f"/session/{session_id}", directory=directory, body={"title": title}, timeout=10)
 

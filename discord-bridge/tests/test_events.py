@@ -353,6 +353,18 @@ def test_reply_ignores_earlier_requests_and_text_that_is_not_the_agents():
     assert turn_reply(messages[:1], "u1") == ("", None)
 
 
+def test_the_previous_requests_message_sent_again_is_not_this_turns():
+    # After a request ends, OpenCode sends its user message again with a
+    # summary. That can arrive after the next request's turn has started.
+    turn = Turn("ses_1", 600)
+    turn.apply("message.updated", {"info": {"id": "msg_old", "role": "user", "summary": {"diffs": []}}})
+    assert turn.user_message_id is None
+    turn.apply("message.updated", {"info": {"id": "msg_new", "role": "user"}})
+    turn.apply("message.updated", {"info": {"id": "msg_new", "role": "user", "summary": {"diffs": []}}})
+    turn.apply("message.updated", {"info": {"id": "msg_note", "role": "user"}})  # a note later in the turn
+    assert turn.user_message_id == "msg_new"
+
+
 def test_the_agents_notes_to_itself_are_not_new_requests():
     # What a command run as a subtask leaves: the command, the task tool call,
     # a note the agent adds after the subtask, and the answer.

@@ -164,7 +164,10 @@ class Turn:
         self._roles[info.get("id")] = info.get("role")
         if child:
             return
-        if info.get("role") == "user" and self.user_message_id is None:
+        if info.get("role") == "user" and self.user_message_id is None and "summary" not in info:
+            # A new message arrives without a summary. OpenCode sends the
+            # previous request's message again, with its summary, after that
+            # request ends, and that can land after this turn has started.
             self.user_message_id = info.get("id")
         elif info.get("role") == "assistant":
             self.active = True

@@ -1,6 +1,6 @@
 import asyncio
 
-from catalog import Catalog, parse_agents, parse_commands, parse_models, split_model
+from catalog import Catalog, model_key, parse_agents, parse_commands, parse_models, split_model
 from sample import AGENTS, COMMANDS, FLASH, PRO, PROVIDERS, snapshot
 
 
@@ -127,6 +127,24 @@ def test_failed_refresh_keeps_the_last_good_snapshot():
         assert await catalog.get() is first
 
     asyncio.run(run())
+
+
+def test_a_failing_command_list_leaves_the_rest_of_the_catalog_working():
+    async def run():
+        agent = FakeAgent()
+
+        async def commands(directory):
+            raise OSError("GET /command -> 500")
+
+        agent.commands = commands
+        snap = await Catalog(agent, "/work/repo").get()
+        assert snap.commands == {} and list(snap.models) == [FLASH, PRO] and snap.default_model == FLASH
+
+    asyncio.run(run())
+
+
+def test_model_key_is_the_inverse_of_split_model():
+    assert model_key(split_model(FLASH)) == FLASH
 
 
 def test_default_model_missing_from_the_list_is_not_used():
