@@ -206,7 +206,7 @@ def reply(message_id, text="", tools=()):
 
 
 ALL_COMMANDS = {
-    "model", "effort", "agent", "status", "help", "stop", "new", "compact", "todo", "diff", "export",
+    "model", "effort", "agent", "status", "help", "stop", "clear", "compact", "todo", "diff", "export",
     "undo", "redo", "fork", "rename", "shell", "command",
 }
 
@@ -271,7 +271,7 @@ def test_unknown_model_is_refused_privately_and_changes_nothing(tmp_path):
 
 
 THREAD_COMMANDS = [
-    ("stop", {}), ("new", {}), ("compact", {}), ("todo", {}), ("diff", {}), ("export", {}), ("undo", {}),
+    ("stop", {}), ("clear", {}), ("compact", {}), ("todo", {}), ("diff", {}), ("export", {}), ("undo", {}),
     ("redo", {}), ("fork", {}), ("rename", {"name": "x"}), ("shell", {"command": "ls"}),
     ("command", {"name": "review"}),
 ]
@@ -371,14 +371,39 @@ def test_stop_needs_something_running(tmp_path):
     assert interaction.followup.sent == [("Stopped the current request.", False)]
 
 
-def test_new_drops_the_session_but_keeps_the_settings(tmp_path):
+def test_clear_drops_the_session_keeps_the_settings_and_deletes_the_old_one_after_the_queue(tmp_path):
     h = Harness(tmp_path)
     h.entry.update(sessionId="ses_old", model=PRO)
-    interaction = h.run("new")
+    interaction = h.run("clear")
     assert h.stopped == [(THREAD, 7)]
     assert h.entry["sessionId"] is None and h.entry["model"] == PRO
     assert h.saved().threads[str(THREAD)]["sessionId"] is None
-    assert "fresh session" in interaction.followup.sent[0][0]
+    assert "Cleared this thread's context" in interaction.followup.sent[0][0]
+    # Deleted from the thread's queue, after whatever request was stopped has finished.
+    assert h.agent.calls == [] and [thread_id for thread_id, _ in h.queue.jobs] == [THREAD]
+    h.enabled = False  # a channel disabled meanwhile doesn't keep the old session around
+    h.queue.run_all()
+    assert h.agent.calls == [("delete", "ses_old")]
+
+
+def test_clear_without_a_session_deletes_nothing(tmp_path):
+    h = Harness(tmp_path)
+    interaction = h.run("clear")
+    assert h.queue.jobs == [] and h.entry["sessionId"] is None
+    assert "Cleared this thread's context" in interaction.followup.sent[0][0]
+
+
+def test_clear_still_clears_when_the_old_session_cannot_be_deleted(tmp_path):
+    h = Harness(tmp_path)
+    h.entry["sessionId"] = "ses_old"
+
+    async def refuse_delete(session_id, directory):
+        raise OSError("agent unreachable")
+
+    h.agent.delete_session = refuse_delete
+    h.run("clear")
+    h.queue.run_all()  # logs a warning, raises nothing
+    assert h.entry["sessionId"] is None
 
 
 def test_compact_waits_its_turn_and_uses_the_threads_model(tmp_path):

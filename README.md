@@ -150,7 +150,7 @@ Anyone who can post in an enabled channel can use its session commands. Changes 
 | `/stop` | Same as `!stop` |
 | `/undo` | Take back the last request and its file changes. Asks first, naming the files. Run it again to go further back. |
 | `/redo` | Bring back what `/undo` took back, until the next message is sent |
-| `/new` | Start a fresh session in the same thread. Settings stay, earlier context is dropped. |
+| `/clear` | Clear the thread's context and start over. Stops any running request and drops waiting ones. Settings stay, and the old session is deleted from the agent. |
 | `/compact` | Replace the conversation so far with a summary, to free up context |
 | `/fork` | Open a new thread that carries on from here, with a copy of the conversation and settings |
 | `/rename` | Rename the thread and its session |

@@ -661,7 +661,7 @@ def setup(tree, ctx):
             "**The session**\n"
             "`/stop` stop the current request and drop waiting ones (`!stop` does the same)\n"
             "`/undo` take back the last request and its file changes, `/redo` bring it back\n"
-            "`/new` start a fresh session in the same thread\n"
+            "`/clear` clear the context and start over in the same thread\n"
             "`/compact` replace the conversation so far with a summary to free up context\n"
             "`/fork` open a new thread that carries on from here\n"
             "`/rename` rename the thread and its session\n"
@@ -692,22 +692,34 @@ def setup(tree, ctx):
         await ctx.stop_thread(interaction.channel_id, entry, stop_point)
         await interaction.followup.send("Stopped the current request.", allowed_mentions=NO_MENTIONS)
 
-    @tree.command(name="new", description="Start a fresh session in this thread. Settings stay, context is dropped.")
+    @tree.command(name="clear", description="Clear this thread's context and start over. Settings stay.")
     @app_commands.guild_only()
-    async def new(interaction: discord.Interaction):
+    async def clear(interaction: discord.Interaction):
         stop_point = ctx.queue.stop_point()
         entry = await thread_entry(interaction)
         if entry is None:
             return
         await interaction.response.defer()
-        note(interaction, "new")
+        note(interaction, "clear")
         await ctx.stop_thread(interaction.channel_id, entry, stop_point)
-        # The next message creates the new session. The old one stays on the agent.
+        old, directory = entry.get("sessionId"), entry["directory"]
+        # Cleared before anything waits, so the next message creates a new session.
         entry["sessionId"] = None
         ctx.store.save()
+        if old:
+
+            async def delete_old():
+                try:
+                    await ctx.agent.delete_session(old, directory)
+                    log.info("thread %s: deleted session %s", interaction.channel_id, old)
+                except Exception as err:
+                    log.warning("thread %s: could not delete session %s: %s", interaction.channel_id, old, err)
+
+            # Queued, so a stopped request finishes writing up its outcome
+            # before its session goes. Not skipped for a disabled channel.
+            ctx.queue.submit(interaction.channel_id, delete_old)
         await interaction.followup.send(
-            "Started a fresh session for this thread. Its settings are kept, "
-            "and earlier messages are no longer part of the context.",
+            "Cleared this thread's context. Its settings are kept, and the next message starts from scratch.",
             allowed_mentions=NO_MENTIONS,
         )
 
@@ -729,7 +741,7 @@ def setup(tree, ctx):
         channel = channel_of(interaction)
 
         async def job():
-            session_id = entry.get("sessionId")  # read here: /new may have run while this waited
+            session_id = entry.get("sessionId")  # read here: /clear may have run while this waited
             if not session_id:
                 return await ctx.send(channel, "There is nothing to compact: this thread has a fresh session.")
             # Also read here: /model may have changed while this waited.
