@@ -732,9 +732,9 @@ def test_a_failed_rename_does_not_stop_the_first_request(server):
 
 
 def test_a_message_starting_with_the_skip_prefix_is_left_alone(server, monkeypatch):
-    with_file = Message(server.thread, "//  have a look at this", mention=False)
+    with_file = Message(server.thread, ">>  have a look at this", mention=False)
     with_file.attachments = [types.SimpleNamespace(filename="shot.png")]
-    for message in (Message(server.thread, "// lunch?", mention=False), with_file):
+    for message in (Message(server.thread, ">> lunch?", mention=False), with_file):
         asyncio.run(bridge.on_message(message))
     assert bridge.queue.submitted == [] and server.thread.sent == []
 
@@ -747,19 +747,19 @@ def test_a_message_starting_with_the_skip_prefix_is_left_alone(server, monkeypat
 
     monkeypatch.setattr(bridge.questions, "open_for", lambda thread_id: ["que_1"])
     monkeypatch.setattr(bridge.questions, "answer_from_message", answer_from_message)
-    asyncio.run(bridge.on_message(Message(server.thread, "//which one do we pick?", mention=False)))
+    asyncio.run(bridge.on_message(Message(server.thread, ">>which one do we pick?", mention=False)))
     assert answered == [] and server.thread.sent == [] and bridge.queue.submitted == []
     asyncio.run(bridge.on_message(Message(server.thread, "the second", mention=False)))
     assert answered == ["the second"]
 
 
 def test_a_skip_prefix_anywhere_but_the_start_is_still_forwarded(server):
-    asyncio.run(bridge.on_message(Message(server.thread, "see https://example.com/a//b", mention=False)))
+    asyncio.run(bridge.on_message(Message(server.thread, "see https://example.com/a>>b", mention=False)))
     assert [tid for tid, _ in bridge.queue.submitted] == [THREAD]
 
 
 def test_the_skip_prefix_does_not_apply_to_a_new_request(server):
-    message = Message(Channel(CHANNEL), "// fix the login bug")
+    message = Message(Channel(CHANNEL), ">> fix the login bug")
     asyncio.run(bridge.on_message(message))
     assert len(message.threads) == 1 and [tid for tid, _ in bridge.queue.submitted] == [700]
 

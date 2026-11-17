@@ -8,7 +8,7 @@
 - Any later message in that thread continues the same session, for as long
   as the thread's parent channel stays enabled.
 - Threads run in parallel, up to MAX_CONCURRENT at once.
-- A message in a thread that starts with "//" is left for the people there:
+- A message in a thread that starts with ">>" is left for the people there:
   the agent never sees it.
 - "!stop" in a thread aborts the running request and drops that thread's
   queued ones. A request is also stopped when it works longer than
@@ -933,7 +933,7 @@ command_buttons = commands.setup(
 USER_MESSAGE_TYPES = (discord.MessageType.default, discord.MessageType.reply)
 # A message in one of the bridge's threads that starts with this is left alone:
 # not sent to the agent, not taken as an answer, attachments or not.
-SKIP_PREFIX = "//"
+SKIP_PREFIX = ">>"
 
 
 @client.event

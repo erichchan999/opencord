@@ -86,7 +86,7 @@ On Windows, `.\start.ps1` does the same, with `-Status`, `-Logs` and `-Stop`. If
 - **Files back:** ask the agent for a file and it attaches it after its reply, up to 8 MB each.
 - **Questions:** the agent's questions appear with buttons. Anyone in the thread can answer, and the request's time limit is paused meanwhile.
 - **Stop:** `!stop` or `/stop` stops the running request and drops the thread's waiting messages.
-- **Side chat:** a message in a thread that starts with `//` is ignored, so people can talk there without the agent picking it up.
+- **Side chat:** a message in a thread that starts with `>>` is ignored, so people can talk there without the agent picking it up.
 - **About the system:** the agent can answer questions about opencord itself from its copy of this repo.
 
 A request is stopped, and the thread told, when it hits one of these limits, set in `secrets/bridge.env`:
