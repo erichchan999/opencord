@@ -51,6 +51,11 @@ def parse_agents(agents):
     }
 
 
+def parse_commands(commands):
+    """GET /command -> {name: description}."""
+    return {command["name"]: command.get("description") or "" for command in commands or [] if command.get("name")}
+
+
 def split_model(key):
     provider_id, _, model_id = key.partition("/")
     return {"providerID": provider_id, "modelID": model_id}
@@ -60,6 +65,7 @@ def split_model(key):
 class Snapshot:
     models: dict = field(default_factory=dict)
     agents: dict = field(default_factory=dict)
+    commands: dict = field(default_factory=dict)  # the agent's own slash commands and skills
     default_model: str | None = None
     default_agent: str = "build"
 
@@ -134,10 +140,11 @@ class Catalog:
         self._refreshing = None
 
     async def _fetch(self):
-        providers, config, agents = await asyncio.gather(
+        providers, config, agents, commands = await asyncio.gather(
             self._agent.providers(self._directory),
             self._agent.config(self._directory),
             self._agent.agents(self._directory),
+            self._agent.commands(self._directory),
         )
         models = parse_models(providers or {})
         default_model = (config or {}).get("model")
@@ -146,6 +153,7 @@ class Catalog:
         self._snapshot = Snapshot(
             models=models,
             agents=parse_agents(agents),
+            commands=parse_commands(commands),
             default_model=default_model,
             # OpenCode uses "build" unless its config names another agent.
             default_agent=(config or {}).get("default_agent") or "build",

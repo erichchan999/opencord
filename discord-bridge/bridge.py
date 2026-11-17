@@ -11,15 +11,26 @@
   queued ones. A request that runs longer than PROMPT_TIMEOUT_SECONDS (30 min)
   is aborted too, freeing its slot.
 - Slash commands (commands.py) choose a thread's model, thinking effort and
-  agent, and control its session. The bridge keeps those settings (state.py)
-  and sends them with every prompt.
+  agent, and control its session: undo, fork, diff, shell commands, the
+  agent's own commands and more. The bridge keeps the settings (state.py) and
+  sends them with every prompt.
+- Text files attached to a message are sent to the agent as their content.
+  Other attachments are passed as links.
+- A prompt is handed to the agent and the work is then followed on the agent's
+  event stream (events.py). While it runs, one status message in the thread
+  shows what the agent is doing (status.py), and the agent's questions appear
+  with buttons (questions.py).
+- A request that was running when the bridge stopped is picked back up when it
+  starts again.
 
 This container holds the Discord bot token. It never runs user commands; it
 only forwards text to the agent's HTTP API and posts the replies back.
 """
 
 import asyncio
+import base64
 import contextlib
+import functools
 import itertools
 import logging
 import os
@@ -33,9 +44,13 @@ import discord
 from discord import app_commands
 
 import commands
+import events
 from catalog import Catalog
-from opencode import OpenCode, OpenCodeError, PromptTimedOut
+from events import Router, parts_text, turn_reply, wait_for_turn
+from opencode import OpenCode, OpenCodeError
+from questions import Questions
 from state import Store, set_setting, settings_of
+from status import StatusMessage, format_duration, render_finished, render_working
 
 logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s", stream=sys.stdout)
 logging.getLogger("discord").setLevel(logging.WARNING)
@@ -57,15 +72,31 @@ OPENCODE_PASSWORD = env("OPENCODE_SERVER_PASSWORD")
 STATE_FILE = os.environ.get("STATE_FILE", "/data/threads.json")
 BASE_DIR = os.environ.get("BASE_DIR", "/work/repo")
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "16"))
+# Longest a request may work, not counting time spent waiting for a person to
+# answer a question.
 PROMPT_TIMEOUT = float(os.environ.get("PROMPT_TIMEOUT_SECONDS", "1800"))
+# A request is stopped when the agent shows no activity at all for this long.
+SILENCE_TIMEOUT = float(os.environ.get("PROMPT_SILENCE_SECONDS", "900"))
+# A request is stopped when a question from the agent goes unanswered this long.
+QUESTION_TIMEOUT = float(os.environ.get("QUESTION_TIMEOUT_SECONDS", "3600"))
 # Longest wait for /compact, which is one model call over the whole conversation.
 COMPACT_TIMEOUT = 300
+# Longest a /shell command may run.
+SHELL_TIMEOUT = float(os.environ.get("SHELL_TIMEOUT_SECONDS", "600"))
+# Text files attached to a message are sent to the agent as their content, up
+# to this size each. Bigger files, and files that are not text, are passed as a
+# link instead.
+TEXT_ATTACHMENT_LIMIT = 100_000
+# How many of a session's latest messages are read to find the reply to a request.
+REPLY_MESSAGES = 50
 DISCORD_LIMIT = 1900
 
 NO_MENTIONS = discord.AllowedMentions.none()
 agent = OpenCode(OPENCODE_URL, OPENCODE_PASSWORD)
-store = Store(STATE_FILE, BASE_DIR)  # thread -> session map and settings
+store = Store(STATE_FILE, BASE_DIR)  # thread -> session map, settings, open questions
 catalog = Catalog(agent, BASE_DIR)  # models, effort levels and agents the agent offers
+router = Router()  # the requests in progress, fed from the agent's event stream
+shutting_down = False  # set when the bridge has been told to stop
 
 
 # ---------------------------------------------------------------- queueing
@@ -158,8 +189,12 @@ def split_for_discord(text):
     return chunks
 
 
-async def send(channel, content):
-    await channel.send(content, allowed_mentions=NO_MENTIONS)
+async def send(channel, content, file=None):
+    """Posts a message, with `file` (a discord.File) attached if given."""
+    if file is None:
+        await channel.send(content, allowed_mentions=NO_MENTIONS)
+    else:
+        await channel.send(content, file=file, allowed_mentions=NO_MENTIONS)
 
 
 async def send_long(channel, text):
@@ -178,15 +213,73 @@ def mentions_bot(message, bot_id):
 
 
 def clean_content(message, bot_id):
+    """The message's text without the mention of the bot. Attachments are not included."""
     role = bot_role(message)
     text = re.sub(rf"<@!?{bot_id}>", "", message.content)
     if role is not None:
         text = text.replace(f"<@&{role.id}>", "")
-    text = text.strip()
-    files = [f"{a.filename}: {a.url}" for a in message.attachments]
-    if files:
-        text += "\n\n(Attached files, fetch them if needed:\n" + "\n".join(files) + ")"
-    return text
+    return text.strip()
+
+
+# Attachments of these kinds are read as text. Discord guesses the type from
+# the file name and leaves it out for names it does not know, so common
+# source file endings count too.
+TEXT_TYPES = {
+    "application/json", "application/xml", "application/javascript", "application/x-javascript",
+    "application/yaml", "application/x-yaml", "application/toml", "application/x-sh", "application/sql",
+    "application/x-python", "application/typescript",
+}
+TEXT_SUFFIXES = {
+    ".txt", ".md", ".rst", ".log", ".csv", ".tsv", ".json", ".jsonl", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+    ".conf", ".env", ".xml", ".html", ".css", ".scss", ".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+    ".java", ".kt", ".go", ".rs", ".rb", ".php", ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".swift", ".sh",
+    ".bash", ".ps1", ".sql", ".diff", ".patch", ".dockerfile", ".gradle", ".lua", ".r", ".vue", ".svelte",
+}
+
+
+def looks_like_text(attachment):
+    kind = (attachment.content_type or "").split(";")[0].strip().lower()
+    suffix = os.path.splitext(attachment.filename or "")[1].lower()
+    return kind.startswith("text/") or kind in TEXT_TYPES or suffix in TEXT_SUFFIXES
+
+
+async def attachment_parts(message):
+    """(file parts, links) for a message's attachments.
+
+    Text files up to TEXT_ATTACHMENT_LIMIT become file parts, which the agent
+    reads as their content. Every other attachment is listed as a link.
+    """
+    parts, links = [], []
+    for attachment in message.attachments:
+        data = None
+        if looks_like_text(attachment) and attachment.size <= TEXT_ATTACHMENT_LIMIT:
+            try:
+                data = await attachment.read()
+                if "\x00" in data.decode("utf-8"):
+                    data = None  # not text after all
+            except (discord.HTTPException, UnicodeDecodeError) as err:
+                log.info("attachment %s is passed as a link: %s", attachment.filename, err)
+                data = None
+        if data is None:
+            links.append(f"{attachment.filename}: {attachment.url}")
+            continue
+        parts.append(
+            {
+                # Sent as plain text whatever the file is: the agent turns
+                # text/plain into file content, but refuses some other text types.
+                "type": "file",
+                "mime": "text/plain",
+                "filename": attachment.filename,
+                "url": "data:text/plain;base64," + base64.b64encode(data).decode("ascii"),
+            }
+        )
+    return parts, links
+
+
+def with_links(text, links):
+    if not links:
+        return text
+    return (text + "\n\n" if text else "") + "(Attached files, fetch them if needed:\n" + "\n".join(links) + ")"
 
 
 def thread_name(text, author):
@@ -197,16 +290,7 @@ def thread_name(text, author):
 def session_title(thread):
     # A thread that wasn't in discord.py's cache arrives as a PartialMessageable,
     # which has no name.
-    return f"Discord: {getattr(thread, 'name', None) or thread.id}"
-
-
-def parts_text(parts):
-    texts = [
-        p["text"]
-        for p in parts or []
-        if p.get("type") == "text" and not p.get("synthetic") and not p.get("ignored") and p.get("text")
-    ]
-    return "\n\n".join(texts).strip()
+    return commands.session_title(getattr(thread, "name", None) or thread.id)
 
 
 async def keep_typing(channel):
@@ -222,7 +306,7 @@ async def keep_typing(channel):
 def register_thread(thread, author):
     # Registered right away, before the request waits for a slot, so messages
     # posted in the thread meanwhile are queued behind it instead of ignored.
-    # run_prompt creates the session when the first request runs.
+    # run_turn creates the session when the first request runs.
     entry = store.register_thread(thread.id, author.id)
     log.info("thread %s opened by %s", thread.id, author.name)
     return entry
@@ -238,25 +322,78 @@ async def thread_parent_id(thread):
     return parent_id
 
 
+def channel_for(thread_id):
+    """Something to send to for a thread id, whether or not discord.py has the thread cached."""
+    return client.get_channel(int(thread_id)) or client.get_partial_messageable(int(thread_id))
+
+
+async def thread_for_session(session_id):
+    """The thread a session belongs to. A subagent's session counts as its parent's."""
+    for _ in range(4):
+        session_id = router.root(session_id)
+        for thread_id, entry in store.threads.items():
+            if entry.get("sessionId") == session_id:
+                return int(thread_id)
+        # Not known from the stream (the subagent started before the bridge did): ask the agent.
+        try:
+            session_id = ((await agent.session(session_id, BASE_DIR)) or {}).get("parentID")
+        except Exception:
+            return None
+        if not session_id:
+            return None
+    return None
+
+
+def question_opened(thread_id):
+    turn = router.turn_for_thread(thread_id)
+    if turn is not None:
+        turn.pause()  # the request's clock stops while a person is being waited on
+
+
+def question_closed(thread_id):
+    turn = router.turn_for_thread(thread_id)
+    if turn is not None:
+        turn.resume()
+
+
+questions = Questions(
+    store,
+    agent,
+    BASE_DIR,
+    channel_for=channel_for,
+    thread_for_session=thread_for_session,
+    on_open=question_opened,
+    on_close=question_closed,
+)
+router.on_question = questions.ask
+router.on_question_closed = questions.closed
+
+
 async def stop_thread(thread_id, entry, stop_point):
-    """Drops the thread's jobs submitted before stop_point and aborts the one running."""
+    """Drops the thread's jobs submitted before stop_point and stops the one running."""
     queue.drop_waiting(thread_id, stop_point)
+    turn = router.turn_for_thread(thread_id)
+    if turn is not None:
+        turn.stopped = True
+    await questions.close_thread(thread_id, "Stopped before it was answered.")
     if entry.get("sessionId"):
         with contextlib.suppress(Exception):
             await agent.abort(entry["sessionId"], entry["directory"])
 
 
 async def prompt_settings(thread, entry):
-    """The model, variant and agent fields for this thread's next prompt.
+    """(fields, label) for this thread's next prompt.
 
-    A setting the agent no longer offers (opencode.json changed since it was
-    chosen) is removed from the thread, and the thread is told.
+    `fields` are the model, variant and agent to send. `label` says the same
+    in words, for the status message. A setting the agent no longer offers
+    (opencode.json changed since it was chosen) is removed from the thread,
+    and the thread is told.
     """
     try:
         snapshot = await catalog.get()
     except Exception as err:
         log.error("thread %s: could not read the model list, sending without settings: %s", thread.id, err)
-        return {}
+        return {}, ""
     options, dropped = snapshot.resolve(settings_of(entry))
     if dropped:
         for name in dropped:
@@ -267,89 +404,275 @@ async def prompt_settings(thread, entry):
             f"The {' and '.join(dropped)} chosen for this thread {'is' if len(dropped) == 1 else 'are'} "
             "no longer offered by the agent, so I went back to the default.",
         )
-    return options
+    label = []
+    if "model" in options:
+        label.append(snapshot.model_name(f"{options['model']['providerID']}/{options['model']['modelID']}"))
+    if "variant" in options:
+        label.append(f"effort {options['variant']}")
+    if "agent" in options:
+        label.append(f"{options['agent']} agent")
+    return options, " · ".join(label)
 
 
-async def run_prompt(thread, entry, message, text):
-    started = time.monotonic()
-    log.info("thread %s: prompt from %s (%d chars)", thread.id, message.author.name, len(text))
-    typing = asyncio.create_task(keep_typing(thread))
-    try:
-        if not entry.get("sessionId"):
-            entry["sessionId"] = await agent.create_session(entry["directory"], session_title(thread))
-            log.info("thread %s: session %s", thread.id, entry["sessionId"])
-            moved = entry.pop("movedToSharedClone", False)
-            store.save()
-            if moved:
-                await send(
-                    thread,
-                    "This thread now works in the shared checkout, so I started a fresh session. "
-                    "Earlier context from this thread is not carried over.",
-                )
-
-        options = await prompt_settings(thread, entry)
-        model = options.get("model")
-        log.info(
-            "thread %s: model %s, effort %s, agent %s",
-            thread.id,
-            f"{model['providerID']}/{model['modelID']}" if model else "default",
-            options.get("variant", "default"),
-            options.get("agent", "default"),
-        )
-        body = {
-            "parts": [{"type": "text", "text": f"Discord user {message.author.display_name} says:\n\n{text}"}],
-            # The agent's question tool waits for an answer, and the bridge has
-            # no way to give one yet, so a question would hold the request
-            # until it times out. Off until the bridge can show questions.
-            "tools": {"question": False},
-            **options,
-        }
-        try:
-            try:
-                result = await agent.prompt(entry["sessionId"], entry["directory"], body, PROMPT_TIMEOUT)
-            except OpenCodeError as err:
-                if err.status != 404:
-                    raise
-                # Session disappeared (e.g. agent data volume was reset): start a new one.
-                entry["sessionId"] = await agent.create_session(entry["directory"], session_title(thread))
-                store.save()
-                await send(thread, "My earlier context for this thread was lost, so I started a fresh session.")
-                result = await agent.prompt(entry["sessionId"], entry["directory"], body, PROMPT_TIMEOUT)
-        except PromptTimedOut as err:
-            minutes = round(PROMPT_TIMEOUT / 60)
-            log.info(
-                "thread %s: timed out after %d min, %s session %s",
-                thread.id, minutes, "stopped" if err.aborted else "could not stop", entry["sessionId"],
-            )
+async def ensure_session(thread, entry):
+    """The thread's session id. A thread that has none yet gets a new session."""
+    if not entry.get("sessionId"):
+        entry["sessionId"] = await agent.create_session(entry["directory"], session_title(thread))
+        log.info("thread %s: session %s", thread.id, entry["sessionId"])
+        moved = entry.pop("movedToSharedClone", False)
+        store.save()
+        if moved:
             await send(
                 thread,
-                f"I stopped this request because it ran for more than {minutes} minutes. "
-                "Anything it changed so far is still in the checkout. Send another message to carry on."
-                if err.aborted
-                else f"This request ran for more than {minutes} minutes. "
-                "I tried to stop it but the agent didn't respond, so it may still be running.",
+                "This thread now works in the shared checkout, so I started a fresh session. "
+                "Earlier context from this thread is not carried over.",
             )
-            return
+    return entry["sessionId"]
 
-        result = result if isinstance(result, dict) else {}
-        reply = parts_text(result.get("parts"))
-        error = (result.get("info") or {}).get("error")
-        detail = ((error.get("data") or {}).get("message") or error.get("name") or "unknown error") if error else None
-        seconds = round(time.monotonic() - started)
+
+async def run_turn(thread, entry, author, text, files=()):
+    """Sends one message to the agent and follows the work until it ends.
+
+    `files` are file parts from attachment_parts, sent along with the text.
+    """
+    log.info("thread %s: prompt from %s (%d chars, %d files)", thread.id, author.name, len(text), len(files))
+    await ensure_session(thread, entry)
+    options, label = await prompt_settings(thread, entry)
+    log.info("thread %s: using %s", thread.id, label or "the agent's defaults")
+    says = text or "(No message, only the attached files.)"
+    if files:
+        # Without this the agent looks for the files in the checkout, fails to
+        # find them, and distrusts the content it was given.
+        names = ", ".join(part["filename"] for part in files)
+        says += f"\n\n(Attached to this message, with their content included here: {names}. They are not in the checkout.)"
+    body = {
+        "parts": [{"type": "text", "text": f"Discord user {author.display_name} says:\n\n{says}"}, *files],
+        # The agent may ask questions: they are answered from Discord. Sent
+        # every time, because sessions used before the bridge could do that
+        # have the tool switched off, and this switches it back on.
+        "tools": {"question": True},
+        **options,
+    }
+    # Registered before the prompt goes out, so none of its events are missed.
+    turn = router.start(entry["sessionId"], thread.id)
+    try:
+        try:
+            await agent.prompt_async(entry["sessionId"], entry["directory"], body)
+        except OpenCodeError as err:
+            if err.status != 404:
+                raise
+            # Session disappeared (e.g. agent data volume was reset): start a new one.
+            router.finish(turn)
+            entry["sessionId"] = await agent.create_session(entry["directory"], session_title(thread))
+            store.save()
+            await send(thread, "My earlier context for this thread was lost, so I started a fresh session.")
+            turn = router.start(entry["sessionId"], thread.id)
+            await agent.prompt_async(entry["sessionId"], entry["directory"], body)
+        await follow_turn(thread, entry, turn, label, time.time())
+    finally:
+        router.finish(turn)
+
+
+def command_ended(turn, call):
+    """The request behind a /command returned. Its work is over, or it failed to start."""
+    if call.cancelled():
+        return
+    err = call.exception()
+    if err is None:
+        turn.done.set()
+        return
+    # The agent may still be working (the connection dropped, say). The waiter
+    # asks the agent, and ends the turn with this error if it is not.
+    if turn.error is None:
+        turn.error = (type(err).__name__, str(err))
+    turn.wake.set()
+
+
+async def run_command(thread, entry, name, arguments):
+    """Runs one of the agent's slash commands and follows the work like a prompt's."""
+    log.info("thread %s: /%s (%d chars of arguments)", thread.id, name, len(arguments))
+    session_id = await ensure_session(thread, entry)
+    options, label = await prompt_settings(thread, entry)
+    body = {"command": name, "arguments": arguments}
+    if "model" in options:
+        body["model"] = f"{options['model']['providerID']}/{options['model']['modelID']}"
+    if "variant" in options:
+        body["variant"] = options["variant"]
+    if "agent" in options:
+        body["agent"] = options["agent"]
+    turn = router.start(session_id, thread.id)
+    # The command call only returns when the work is done. Its result is the reply.
+    call = asyncio.create_task(agent.command(session_id, entry["directory"], body, PROMPT_TIMEOUT + SILENCE_TIMEOUT))
+    call.add_done_callback(functools.partial(command_ended, turn))
+    try:
+        await follow_turn(thread, entry, turn, " · ".join(filter(None, [f"/{name}", label])), time.time(), call=call)
+    finally:
+        call.cancel()
+        router.finish(turn)
+
+
+async def resume_turn(thread_id, entry):
+    """Picks a request back up after a restart. It may still be running, or have ended meanwhile."""
+    await client.wait_until_ready()
+    info = entry.get("turn") or {}
+    session_id = entry.get("sessionId")
+    if not session_id:
+        entry.pop("turn", None)
+        store.save()
+        return
+    started_at = info.get("startedAt") or time.time()
+    # Registered before asking the agent, so the end of the work is not missed in between.
+    turn = router.start(session_id, int(thread_id), active=True, elapsed=max(0.0, time.time() - started_at))
+    try:
+        working = session_id in await agent.statuses(entry["directory"])
         log.info(
-            "thread %s: %s after %ds",
-            thread.id, f"agent error ({detail})" if error else f"replied, {len(reply)} chars", seconds,
+            "thread %s: picking up a request from before the restart (%s)",
+            thread_id, "still running" if working else "finished meanwhile",
         )
-        if reply:
-            await send_long(thread, reply)
-        if error and error.get("name") == "MessageAbortedError":
-            pass  # someone stopped it, and "!stop" or the command has already answered them
-        elif error:
-            await send(thread, f"The agent stopped with an error: {str(detail)[:500]}")
-        elif not reply:
-            await send(thread, "Done. (The agent finished without a text reply.)")
+        if not working:
+            turn.done.set()
+        for _ in questions.open_for(thread_id):
+            turn.pause()
+        await follow_turn(
+            channel_for(thread_id), entry, turn, info.get("label") or "", started_at, info.get("statusMessageId")
+        )
+    finally:
+        router.finish(turn)
+
+
+async def follow_turn(thread, entry, turn, label, started_at, status_message_id=None, call=None):
+    """Shows a turn's progress in the thread until it ends, then posts the outcome.
+
+    `call` is the task of a request that answers when the work is done (a
+    /command). Its answer is the reply.
+    """
+    status = StatusMessage(thread, status_message_id)
+
+    def render():
+        return render_working(turn, label, started_at)
+
+    async def is_working():
+        return turn.session_id in await agent.statuses(entry["directory"])
+
+    typing = asyncio.create_task(keep_typing(thread))
+    try:
+        await status.show(render())
+        # Kept while the turn runs. A bridge that restarts reads it to pick the request back up.
+        entry["turn"] = {"statusMessageId": status.message_id, "startedAt": started_at, "label": label}
+        store.save()
+        updater = asyncio.create_task(status.follow(turn, render))
+        try:
+            outcome = await wait_for_turn(
+                turn,
+                is_working,
+                time_limit=PROMPT_TIMEOUT,
+                silence_limit=SILENCE_TIMEOUT,
+                question_limit=QUESTION_TIMEOUT,
+                question_age=lambda: questions.oldest_age(thread.id),
+            )
+        finally:
+            updater.cancel()
+        await finish_turn(thread, entry, turn, status, outcome, call)
+    except Exception:
+        # A failure here is reported by the caller. While shutting down the
+        # note stays, failure or not, so the request is resumed on restart.
+        if not shutting_down:
+            entry.pop("turn", None)
+            store.save()
+        raise
     finally:
         typing.cancel()
+
+
+async def call_answer(call):
+    """The message a finished request answered with, or None if there is none to use."""
+    if call is None:
+        return None
+    if not call.done():
+        # The stream can say the work is over a moment before the answer arrives.
+        await asyncio.wait({call}, timeout=15)
+    if not call.done() or call.cancelled() or call.exception() is not None:
+        return None
+    answer = call.result()
+    return answer if isinstance(answer, dict) else None
+
+
+async def finish_turn(thread, entry, turn, status, outcome, call=None):
+    """Posts what a turn produced. `outcome` is what wait_for_turn returned."""
+    limits = {"timeout": PROMPT_TIMEOUT, "silent": SILENCE_TIMEOUT, "unanswered": QUESTION_TIMEOUT}
+    minutes = round(limits.get(outcome, 0) / 60)
+    halted = True
+    if outcome == "done":
+        await questions.close_thread(thread.id)  # none should be left, but the buttons must not linger
+    else:
+        # Still working, or waiting on a person: stop it.
+        await questions.close_thread(thread.id, "Nobody answered in time." if outcome == "unanswered" else "Stopped before it was answered.")
+        try:
+            await agent.abort(turn.session_id, entry["directory"])
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(turn.done.wait(), 10)  # let the agent write the stop down
+        except Exception as err:
+            halted = False
+            log.error("thread %s: could not stop session %s: %s", thread.id, turn.session_id, err)
+
+    reply, error, unread = "", None, None
+    answer = await call_answer(call)
+    try:
+        if answer is not None:
+            reply, error = parts_text(answer.get("parts")), (answer.get("info") or {}).get("error")
+        elif call is not None and call.done() and turn.user_message_id is None:
+            pass  # the request failed before it reached the session: turn.error says why
+        else:
+            messages = await agent.recent_messages(turn.session_id, entry["directory"], REPLY_MESSAGES)
+            reply, error = turn_reply(messages, turn.user_message_id)
+    except Exception as err:
+        unread = err
+        log.error("thread %s: could not read the agent's reply: %s", thread.id, err)
+
+    name = (error or {}).get("name") or (turn.error or (None, None))[0]
+    detail = ((error or {}).get("data") or {}).get("message") or (turn.error or (None, None))[1] or name
+    if outcome != "done":
+        result = outcome
+    elif turn.stopped or name == "MessageAbortedError":
+        result = "stopped"  # by a person, and "!stop" or the command has already answered them
+    elif name:
+        result = "error"
+    else:
+        result = "done"
+    log.info(
+        "thread %s: %s after %s, %d tool calls, %d chars",
+        thread.id, f"error ({detail})" if result == "error" else result,
+        format_duration(turn.running_for()), len(turn.tools), len(reply),
+    )
+    await status.show(render_finished(turn, result, minutes))
+
+    if reply:
+        await send_long(thread, reply)
+    carry_on = "Anything it changed so far is still in the checkout. Send another message to carry on."
+    if result == "timeout" and halted:
+        await send(thread, f"I stopped this request because it ran for more than {minutes} minutes. {carry_on}")
+    elif result == "silent" and halted:
+        await send(thread, f"I stopped this request because the agent showed no activity for {minutes} minutes. {carry_on}")
+    elif result in ("timeout", "silent"):
+        await send(thread, "This request ran past its limit. I tried to stop it but the agent didn't respond, so it may still be running.")
+    elif result == "unanswered":
+        await send(thread, f"Nobody answered the agent's question within {minutes} minutes, so I stopped this request. {carry_on}")
+    elif result == "error":
+        await send(thread, f"The agent stopped with an error: {str(detail)[:500]}")
+    elif result == "done" and unread:
+        await send(thread, f"The agent finished, but I could not read its reply: {str(unread)[:300]}")
+    elif result == "done" and not reply:
+        await send(thread, "Done. (The agent finished without a text reply.)")
+    # Cleared last: if the bridge stops before this, the restart posts the outcome again rather than losing it.
+    entry.pop("turn", None)
+    store.save()
+
+
+async def open_thread(name, starter):
+    """Opens a thread in the watched channel under a new message `starter`. Returns the thread."""
+    channel = client.get_channel(CHANNEL_ID) or await client.fetch_channel(CHANNEL_ID)
+    message = await channel.send(starter, allowed_mentions=NO_MENTIONS)
+    return await message.create_thread(name=name[:100], auto_archive_duration=1440)
 
 
 async def report_failure(channel, err):
@@ -370,7 +693,7 @@ client = discord.Client(intents=intents, allowed_mentions=NO_MENTIONS)
 
 # Slash commands arrive over the same gateway connection as messages.
 tree = app_commands.CommandTree(client)
-commands.setup(
+command_buttons = commands.setup(
     tree,
     commands.Context(
         store=store,
@@ -379,11 +702,15 @@ commands.setup(
         queue=queue,
         channel_id=CHANNEL_ID,
         compact_timeout=COMPACT_TIMEOUT,
+        shell_timeout=SHELL_TIMEOUT,
         thread_parent_id=thread_parent_id,
         stop_thread=stop_thread,
         send=send,
         report_failure=report_failure,
         keep_typing=keep_typing,
+        ensure_session=ensure_session,
+        run_command=run_command,
+        open_thread=open_thread,
     ),
 )
 
@@ -410,7 +737,7 @@ async def on_message(message):
     entry = store.threads.get(str(channel.id))
     if entry is not None:
         text = clean_content(message, bot_id)
-        if not text:
+        if not text and not message.attachments:
             return
         if text == "!stop":
             stop_point = queue.stop_point()
@@ -421,11 +748,27 @@ async def on_message(message):
                 await message.add_reaction("🛑")
             return
 
+        if questions.open_for(channel.id):
+            # The agent is waiting on a person, so a message here is most
+            # likely the answer. Queued as a request it would sit behind the
+            # very request that is waiting for it.
+            if await thread_parent_id(channel) != CHANNEL_ID:
+                return
+            if text and not message.attachments and await questions.answer_from_message(message, text):
+                with contextlib.suppress(discord.HTTPException):
+                    await message.add_reaction("✅")
+                return
+            await send(
+                channel,
+                "The agent is waiting for answers to the questions above. I will get to your message after that.",
+            )
+
         async def follow_up():
             if await thread_parent_id(channel) != CHANNEL_ID:
                 return
             try:
-                await run_prompt(channel, entry, message, text)
+                files, links = await attachment_parts(message)
+                await run_turn(channel, entry, message.author, with_links(text, links), files)
             except Exception as err:
                 await report_failure(channel, err)
 
@@ -436,14 +779,15 @@ async def on_message(message):
     if channel.id != CHANNEL_ID or not mentions_bot(message, bot_id):
         return
     text = clean_content(message, bot_id)
-    if not text:
+    if not text and not message.attachments:
         await message.reply(
             "Mention me with a question or a task and I will start a thread for it.", allowed_mentions=NO_MENTIONS
         )
         return
 
+    name = thread_name(text or message.attachments[0].filename, message.author.name)
     try:
-        thread = await message.create_thread(name=thread_name(text, message.author.name), auto_archive_duration=1440)
+        thread = await message.create_thread(name=name, auto_archive_duration=1440)
     except discord.HTTPException as err:
         await report_failure(channel, f'could not start a thread (does the bot have "Create Public Threads"?): {err}')
         return
@@ -452,11 +796,58 @@ async def on_message(message):
 
     async def new_request():
         try:
-            await run_prompt(thread, entry, message, text)
+            files, links = await attachment_parts(message)
+            await run_turn(thread, entry, message.author, with_links(text, links), files)
         except Exception as err:
             await report_failure(thread, err)
 
     queue.submit(thread.id, new_request)
+
+
+@client.event
+async def on_interaction(interaction):
+    # Slash commands are handled by the command tree. This is for the buttons
+    # and menus under the agent's questions, and the ones /undo shows.
+    if interaction.type is not discord.InteractionType.component:
+        return
+    try:
+        if not await questions.on_component(interaction):
+            await command_buttons(interaction)
+    except Exception:
+        log.exception("handling a button")
+        with contextlib.suppress(discord.HTTPException):
+            if not interaction.response.is_done():
+                await interaction.response.send_message("Something went wrong on my side.", ephemeral=True)
+
+
+_background = set()  # asyncio only keeps weak references to tasks
+
+
+def in_background(coroutine):
+    task = asyncio.create_task(coroutine)
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+
+
+async def check_questions():
+    try:
+        await questions.reconcile()
+    except Exception as err:
+        log.error("could not check for questions the agent is waiting on: %s", err)
+
+
+def stream_connected():
+    """The event stream is up. What happened while it was away was not sent, so look for it."""
+    router.wake_all()
+    if client.is_ready():
+        in_background(check_questions())
+
+
+async def resume_job(thread_id, entry):
+    try:
+        await resume_turn(thread_id, entry)
+    except Exception as err:
+        await report_failure(channel_for(thread_id), err)
 
 
 _ready_once = False
@@ -486,6 +877,8 @@ async def on_ready():
     except Exception as err:
         log.error("cannot access channel %s: %s", CHANNEL_ID, err)
         return
+    # Questions asked while the bridge was down have no buttons yet.
+    in_background(check_questions())
     # Registered to this one server, where they show up at once. Commands
     # registered globally can take an hour to appear.
     try:
@@ -503,6 +896,7 @@ async def on_ready():
 
 
 async def main():
+    global shutting_down
     store.load()
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -522,9 +916,19 @@ async def main():
             )
         except Exception as err:  # retried on first use
             log.error("could not read the agent's model list yet: %s", err)
+        stream = asyncio.create_task(events.follow(agent, BASE_DIR, router, stream_connected))
+        jobs = asyncio.create_task(router.run_jobs())
+        # Requests that were running when the bridge last stopped go to the
+        # front of their thread's queue, ahead of any new message.
+        for thread_id, entry in store.threads.items():
+            if entry.get("turn"):
+                queue.submit(int(thread_id), functools.partial(resume_job, thread_id, entry))
         bot = asyncio.create_task(client.start(TOKEN))
         stopping = asyncio.create_task(stop.wait())
         done, _ = await asyncio.wait({bot, stopping}, return_when=asyncio.FIRST_COMPLETED)
+        shutting_down = True
+        stream.cancel()
+        jobs.cancel()
         if bot in done:
             bot.result()  # surfaces a login failure
         else:

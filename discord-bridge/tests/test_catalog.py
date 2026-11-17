@@ -1,7 +1,7 @@
 import asyncio
 
-from catalog import Catalog, parse_agents, parse_models, split_model
-from sample import AGENTS, FLASH, PRO, PROVIDERS, snapshot
+from catalog import Catalog, parse_agents, parse_commands, parse_models, split_model
+from sample import AGENTS, COMMANDS, FLASH, PRO, PROVIDERS, snapshot
 
 
 def test_only_connected_providers_are_offered():
@@ -77,6 +77,18 @@ class FakeAgent:
     async def agents(self, directory):
         return AGENTS
 
+    async def commands(self, directory):
+        return COMMANDS
+
+
+def test_parse_commands_keeps_named_ones_with_their_descriptions():
+    assert parse_commands(COMMANDS) == {
+        "init": "guided AGENTS.md setup",
+        "review": "review changes [commit|branch|pr], defaults to uncommitted",
+        "customize-opencode": "Change OpenCode's own settings.",
+    }
+    assert parse_commands(None) == {}
+
 
 def test_catalog_reads_once_then_serves_from_memory():
     async def run():
@@ -86,6 +98,7 @@ def test_catalog_reads_once_then_serves_from_memory():
         second = await catalog.get()
         assert first is second and agent.calls == 1
         assert first.default_model == FLASH and first.default_agent == "build"
+        assert list(first.commands) == ["init", "review", "customize-opencode"]
 
     asyncio.run(run())
 

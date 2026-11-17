@@ -3,13 +3,18 @@ session, and the settings people chose with slash commands.
 
 threads.json:
   {"threads": {"<thread id>": {"sessionId", "directory", "createdBy", "createdAt",
-                                "model", "effort", "agent"}},
-   "defaults": {"model", "effort", "agent"}}
+                                "model", "effort", "agent", "turn"}},
+   "defaults": {"model", "effort", "agent"},
+   "questions": {"<request id>": {...}}}
 
 The three settings are optional everywhere. A missing one means "whatever the
 agent's own config says". `defaults` is what a new thread starts with; it is
 copied into the thread when the thread is opened, so changing it later leaves
 existing threads alone.
+
+`turn` is present only while a request is being worked on. It is how a
+restarted bridge knows which requests to pick back up. `questions` holds the
+agent's questions that people have not answered yet (see questions.py).
 """
 
 import json
@@ -37,12 +42,21 @@ def set_setting(entry, name, value):
         entry.pop(name, None)
 
 
+def usable_question(entry):
+    """True for a stored question request that has everything the buttons need."""
+    if not isinstance(entry, dict) or not isinstance(entry.get("thread"), str):
+        return False
+    lists = [entry.get("questions"), entry.get("answers"), entry.get("messages")]
+    return all(isinstance(item, list) for item in lists) and len(lists[0]) == len(lists[1])
+
+
 class Store:
     def __init__(self, path, base_dir):
         self.path = path
         self.base_dir = base_dir
         self.threads = {}
         self.defaults = {}
+        self.questions = {}
 
     def _set_aside(self, problem):
         # Moved rather than left in place, where the next save would overwrite
@@ -73,6 +87,9 @@ class Store:
         self.threads = {key: entry for key, entry in threads.items() if isinstance(entry, dict)}
         defaults = loaded.get("defaults") if isinstance(loaded, dict) else None
         self.defaults = settings_of(defaults) if isinstance(defaults, dict) else {}
+        questions = loaded.get("questions") if isinstance(loaded, dict) else None
+        questions = questions if isinstance(questions, dict) else {}
+        self.questions = {key: entry for key, entry in questions.items() if usable_question(entry)}
         # Threads from the per-thread-worktree layout move to the shared clone
         # and get a fresh session on their next message.
         for entry in self.threads.values():
@@ -85,7 +102,7 @@ class Store:
         tmp = f"{self.path}.tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump({"threads": self.threads, "defaults": self.defaults}, f, indent=2)
+                json.dump({"threads": self.threads, "defaults": self.defaults, "questions": self.questions}, f, indent=2)
             os.replace(tmp, self.path)
         except OSError as err:
             log.error("could not save state: %s", err)

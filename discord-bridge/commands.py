@@ -6,25 +6,43 @@ and /agent used in the main channel set what new threads start with.
 
 A change is answered publicly, so everyone in the thread sees it. Lookups and
 refusals are shown only to the person who ran the command.
+
+Commands that work on the session (/compact, /fork, /shell, /command and the
+undo button) are queued like messages, so they never run in the middle of a
+request.
 """
 
 import asyncio
 import contextlib
+import io
 import logging
+import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 import discord
 from discord import app_commands
 
 from catalog import DEFAULT_WORD
-from state import set_setting, settings_of
+from events import is_request, parts_text, request_text, tool_detail
+from state import SETTINGS, set_setting, settings_of
+from status import format_tokens, plain, plural, todo_lines
 
 log = logging.getLogger("bridge")
 
 NO_MENTIONS = discord.AllowedMentions.none()
 # How many of a session's latest messages /status reads to find the last reply.
 STATUS_MESSAGES = 20
+MESSAGE_LIMIT = 1900
+# Largest file posted to Discord, which takes up to 10 MB from a bot.
+FILE_LIMIT = 8_000_000
+# Custom ids of the buttons these commands show start with this.
+BUTTON_PREFIX = "c:"
+# Longest wait for Discord to rename a thread. It allows two renames every ten minutes.
+RENAME_WAIT = 10
+# The bridge puts this in front of every message it forwards (see bridge.run_turn).
+SPEAKER = re.compile(r"^Discord user (.+?) says:\n\n", re.S)
 
 
 @dataclass
@@ -37,17 +55,20 @@ class Context:
     queue: Any  # bridge.ThreadQueue
     channel_id: int
     compact_timeout: float
+    shell_timeout: float
     thread_parent_id: Callable  # async (channel) -> parent channel id, or None
     stop_thread: Callable  # async (thread_id, entry, stop_point)
-    send: Callable  # async (channel, text)
+    send: Callable  # async (channel, text, file=None)
     report_failure: Callable  # async (channel, error)
     keep_typing: Callable  # async (channel), runs until cancelled
+    ensure_session: Callable  # async (channel, entry) -> session id, creating one if needed
+    run_command: Callable  # async (channel, entry, name, arguments), follows it like a prompt
+    open_thread: Callable  # async (name, starter text) -> a new thread in the watched channel
 
 
-def format_tokens(count):
-    if count < 1000:
-        return str(count)
-    return f"{count / 1000:.1f}".removesuffix(".0") + "k"
+def session_title(name):
+    """The title a thread's session gets on the agent."""
+    return f"Discord: {name}"
 
 
 def context_usage(messages, snapshot):
@@ -97,10 +118,232 @@ def quoted(text):
     return discord.utils.escape_markdown(text.strip()[:80])
 
 
+def snippet(text, limit=100):
+    """Text from the conversation as one short line that cannot break a message's formatting."""
+    return discord.utils.escape_markdown(plain(text, limit))
+
+
+def name_of(user):
+    return discord.utils.escape_markdown(getattr(user, "display_name", None) or user.name)
+
+
+def file_of(data, filename):
+    """A discord.File holding `data`, cut to what Discord accepts."""
+    if len(data) > FILE_LIMIT:
+        data = data[:FILE_LIMIT] + b"\n\n[cut here: the rest is too large for Discord]\n"
+    return discord.File(io.BytesIO(data), filename=filename)
+
+
+def code_block(text):
+    return "```\n" + text.replace("```", "`​``") + "\n```"
+
+
+# ---------------------------------------------------------------- reading a session
+
+
+def live_messages(messages, session):
+    """(messages still in the conversation, how many were left out).
+
+    After /undo, the messages taken back are still listed until the next
+    prompt drops them for good. They no longer count.
+    """
+    messages = messages or []
+    revert_id = ((session or {}).get("revert") or {}).get("messageID")
+    ids = [(m.get("info") or {}).get("id") for m in messages]
+    if revert_id in ids:
+        cut = ids.index(revert_id)
+        return messages[:cut], len(messages) - cut
+    return messages, 0
+
+
+def asked(message):
+    """(who, text) of a request: the Discord user and what they wrote.
+
+    `who` is None for a slash command, or a prompt sent some other way.
+    """
+    if any(part.get("type") == "subtask" for part in message.get("parts") or []):
+        return None, request_text(message)
+    text = parts_text(message.get("parts"))
+    match = SPEAKER.match(text)
+    if match:
+        return match.group(1), text[match.end() :]
+    return None, text
+
+
+def file_names(changes, limit=10):
+    names = [f"`{plain(change.get('file') or '?', 80)}`" for change in changes[:limit]]
+    more = f" and {len(changes) - limit} more" if len(changes) > limit else ""
+    return ", ".join(names) + more
+
+
+def build_diff(sections):
+    """(text of a .diff file, {file: [lines added, lines removed]}).
+
+    `sections` holds (request number, what was asked, its file changes) for
+    each request in order. Each request's patches get a heading line.
+    """
+    out, totals = [], {}
+    for number, text, changes in sections:
+        if not changes:
+            continue
+        out.append(f"# Request {number}: {plain(text, 200)}")
+        for change in changes:
+            patch = (change.get("patch") or "").rstrip("\n")
+            if patch:
+                out.append(patch)
+            counts = totals.setdefault(change.get("file") or "?", [0, 0])
+            counts[0] += change.get("additions") or 0
+            counts[1] += change.get("deletions") or 0
+        out.append("")
+    return "\n".join(out), totals
+
+
+def diff_summary(totals, limit=15):
+    added = sum(a for a, _ in totals.values())
+    removed = sum(r for _, r in totals.values())
+    lines = [f"**{plural(len(totals), 'file')} changed** in this session (+{added} −{removed}):"]
+    for name, (a, r) in list(totals.items())[:limit]:
+        lines.append(f"`{plain(name, 80)}` +{a} −{r}")
+    if len(totals) > limit:
+        lines.append(f"… and {len(totals) - limit} more")
+    return "\n".join(lines)
+
+
+def stamp(milliseconds):
+    if not milliseconds:
+        return ""
+    return datetime.fromtimestamp(milliseconds / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def transcript(messages, title, session_id, undone=0, now=None):
+    """The conversation as Markdown: each request, then what the agent said and which tools it used."""
+    now = now or datetime.now(timezone.utc)
+    lines = [f"# {title}", "", f"OpenCode session `{session_id}`, exported {now:%Y-%m-%d %H:%M} UTC."]
+
+    def block(*new):
+        """Adds lines as a paragraph of their own: one blank line before them."""
+        if lines and lines[-1] != "":
+            lines.append("")
+        lines.extend(new)
+
+    answered = True
+    for message in messages:
+        info = message.get("info") or {}
+        parts = message.get("parts") or []
+        if info.get("role") == "user":
+            if not is_request(message):
+                continue  # the agent's notes to itself
+            who, text = asked(message)
+            created = stamp((info.get("time") or {}).get("created"))
+            block(f"## {who or 'Request'}" + (f" · {created}" if created else ""))
+            block(text.strip() or "(no text)")
+            files = [part.get("filename") or "file" for part in parts if part.get("type") == "file"]
+            if files:
+                block("Attached: " + ", ".join(f"`{name}`" for name in files))
+            answered = False
+        elif info.get("role") == "assistant":
+            for part in parts:
+                kind = part.get("type")
+                text = (part.get("text") or "").strip()
+                shown = kind == "tool" or (kind == "text" and text and not part.get("synthetic") and not part.get("ignored"))
+                if not shown:
+                    continue
+                if not answered:
+                    block("### Agent")
+                    answered = True
+                if kind == "tool":
+                    tool = part.get("tool") or "tool"
+                    line = f"- `{tool}` {tool_detail(tool, part.get('state') or {})}".rstrip()
+                    if lines[-1].startswith("- `"):
+                        lines.append(line)  # tool calls in a row form one list
+                    else:
+                        block(line)
+                else:
+                    block(text)
+            error = info.get("error")
+            if error:
+                detail = (error.get("data") or {}).get("message") or ""
+                block(f"> ⚠️ {error.get('name') or 'error'}{': ' + detail if detail else ''}")
+    if undone:
+        block(f"_{plural(undone, 'later message')} taken back with /undo {'is' if undone == 1 else 'are'} left out._")
+    return "\n".join(lines).strip() + "\n"
+
+
+def shell_result(message):
+    """(output, error) of a /shell run, from the message the agent stored for it."""
+    for part in (message or {}).get("parts") or []:
+        if part.get("type") == "tool":
+            state = part.get("state") or {}
+            output = state.get("output")
+            if not isinstance(output, str):
+                output = (state.get("metadata") or {}).get("output") or ""
+            return output, state.get("error") if state.get("status") == "error" else None
+    return "", None
+
+
+def shell_message(output, limit=MESSAGE_LIMIT - 100):
+    """(text, full output to attach or None) for posting a command's output."""
+    output = output.rstrip()
+    if not output:
+        return "-# The command printed nothing.", None
+    block = code_block(output)
+    if len(block) <= limit:
+        return block, None
+    # The end of the output usually says how it went.
+    tail = output[-(limit - 100) :]
+    tail = tail[tail.find("\n") + 1 :] if "\n" in tail else tail
+    return code_block("…\n" + tail) + "\n-# The end of the output. All of it is attached.", output
+
+
+def undo_question(target, changes):
+    who, text = asked(target)
+    lines = [f"Undo the last request, “{snippet(text)}”{' from ' + discord.utils.escape_markdown(who) if who else ''}?"]
+    if changes:
+        lines.append(f"These files go back to how they were before it: {file_names(changes)}.")
+        lines.append(
+            "⚠️ Every thread works in the same checkout. If another thread changed these files since, "
+            "those changes are lost too."
+        )
+    else:
+        lines.append("It changed no files, so only the conversation is taken back.")
+    lines.append("`/redo` brings it back, until the next message is sent in this thread.")
+    return "\n".join(lines)
+
+
+def confirm_view(message_id):
+    """The buttons under the /undo question. Must be built while the event loop runs."""
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(label="Undo it", style=discord.ButtonStyle.danger, custom_id=f"{BUTTON_PREFIX}undo:{message_id}")
+    )
+    view.add_item(discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary, custom_id=f"{BUTTON_PREFIX}cancel"))
+    # Stopped so discord.py does not keep it: clicks arrive in on_component.
+    view.stop()
+    return view
+
+
+def fork_name(name):
+    base = re.sub(r" \(fork(?: \d+)?\)$", "", name or "thread")
+    return f"{base[:90]} (fork)"
+
+
+async def gather_limited(calls, limit=4):
+    """Runs the calls (functions returning awaitables) with at most `limit` at a time, results in order."""
+    gate = asyncio.Semaphore(limit)
+
+    async def one(call):
+        async with gate:
+            return await call()
+
+    return await asyncio.gather(*(one(call) for call in calls))
+
+
 def setup(tree, ctx):
     """Adds the commands to `tree`."""
     wrong_place = f"I only work in <#{ctx.channel_id}> and the threads I open there."
     thread_only = "Use this inside one of my threads."
+    busy = "I'm working on a request in this thread. Wait for it to finish, or `/stop` it, then try again."
+    nothing_to_redo = "There is nothing to redo. `/redo` works after `/undo`, until the next message is sent."
 
     def channel_of(interaction):
         return interaction.channel or interaction.client.get_partial_messageable(interaction.channel_id)
@@ -131,6 +374,29 @@ def setup(tree, ctx):
 
     def note(interaction, what):
         log.info("channel %s: /%s by %s", interaction.channel_id, what, interaction.user.name)
+
+    def later(interaction, channel):
+        """Answers a deferred command from a queued job. Posts in the channel if the answer is too late."""
+
+        async def answer(text, file=None):
+            try:
+                if file is None:
+                    await interaction.followup.send(text, allowed_mentions=NO_MENTIONS)
+                else:
+                    await interaction.followup.send(text, file=file, allowed_mentions=NO_MENTIONS)
+            except discord.HTTPException:
+                await ctx.send(channel, text, file)
+
+        return answer
+
+    def queued(interaction):
+        """Said when a queued command will wait for the request in progress."""
+        return " after the current request" if ctx.queue.load(interaction.channel_id) else ""
+
+    async def session_and_messages(entry):
+        """The session and all its messages, read together."""
+        session_id, directory = entry["sessionId"], entry["directory"]
+        return await asyncio.gather(ctx.agent.session(session_id, directory), ctx.agent.messages(session_id, directory))
 
     def when(interaction, where):
         """Added to a change made while the thread is busy."""
@@ -295,23 +561,98 @@ def setup(tree, ctx):
                 lines.append("**Session:** none yet. One starts with the next message.")
         await interaction.followup.send("\n".join(lines), ephemeral=True, allowed_mentions=NO_MENTIONS)
 
+    @tree.command(name="todo", description="Show the agent's todo list for this thread.")
+    @app_commands.guild_only()
+    async def todo(interaction: discord.Interaction):
+        entry = await thread_entry(interaction)
+        if entry is None:
+            return
+        if not entry.get("sessionId"):
+            return await refuse(interaction, "The agent has no todo list here yet.")
+        await interaction.response.defer(ephemeral=True)
+        todos = await ctx.agent.todos(entry["sessionId"], entry["directory"])
+        if not todos:
+            text = "The agent has no todo list in this session."
+        else:
+            finished = sum(1 for item in todos if item.get("status") == "completed")
+            text = f"**Todo list** · {finished} of {len(todos)} done\n" + "\n".join(todo_lines(todos, limit=None))
+        await interaction.followup.send(text[:MESSAGE_LIMIT], ephemeral=True, allowed_mentions=NO_MENTIONS)
+
+    @tree.command(name="diff", description="Post the file changes this thread's session made, as a .diff file.")
+    @app_commands.guild_only()
+    async def diff(interaction: discord.Interaction):
+        entry = await thread_entry(interaction)
+        if entry is None:
+            return
+        if not entry.get("sessionId"):
+            return await refuse(interaction, "This thread hasn't changed any files yet.")
+        await interaction.response.defer()
+        note(interaction, "diff")
+        session_id, directory = entry["sessionId"], entry["directory"]
+        session, messages = await session_and_messages(entry)
+        requests = [m for m in live_messages(messages, session)[0] if is_request(m)]
+        # The agent reports changes one request at a time.
+        changes = await gather_limited(
+            [lambda m=m: ctx.agent.diff(session_id, directory, m["info"]["id"]) for m in requests]
+        )
+        sections = [(number, asked(m)[1], found or []) for number, (m, found) in enumerate(zip(requests, changes), 1)]
+        text, totals = build_diff(sections)
+        if not totals:
+            return await interaction.followup.send("This session hasn't changed any files.", allowed_mentions=NO_MENTIONS)
+        await interaction.followup.send(
+            diff_summary(totals), file=file_of(text.encode(), "changes.diff"), allowed_mentions=NO_MENTIONS
+        )
+
+    @tree.command(name="export", description="Post this thread's conversation with the agent as a Markdown file.")
+    @app_commands.guild_only()
+    async def export(interaction: discord.Interaction):
+        entry = await thread_entry(interaction)
+        if entry is None:
+            return
+        if not entry.get("sessionId"):
+            return await refuse(interaction, "There is nothing to export yet.")
+        await interaction.response.defer()
+        note(interaction, "export")
+        session, messages = await session_and_messages(entry)
+        live, undone = live_messages(messages, session)
+        title = getattr(channel_of(interaction), "name", None) or (session or {}).get("title") or "Conversation"
+        text = transcript(live, title, entry["sessionId"], undone)
+        count = sum(1 for m in live if is_request(m))
+        await interaction.followup.send(
+            f"This thread's conversation so far: {plural(count, 'request')}.",
+            file=file_of(text.encode(), "conversation.md"),
+            allowed_mentions=NO_MENTIONS,
+        )
+
     @tree.command(name="help", description="List what I can do and the commands I understand.")
     @app_commands.guild_only()
     async def help_(interaction: discord.Interaction):
         await refuse(
             interaction,
             f"**Start:** mention me in <#{ctx.channel_id}> with a question or a task. I open a thread, "
-            "and every later message in it continues the same session.\n\n"
-            "**In a thread**\n"
+            "and every later message in it continues the same session. Text files you attach are sent "
+            "to the agent as their content.\n\n"
+            "**Settings**\n"
             "`/model` choose the model\n"
             "`/effort` choose how hard the model thinks\n"
             "`/agent` switch between agents such as `build` and `plan`\n"
-            "`/status` show the thread's settings and how full its context is\n"
+            "**Looking**\n"
+            "`/status` the thread's settings and how full its context is\n"
+            "`/todo` the agent's todo list\n"
+            "`/diff` the files this thread changed, as a `.diff` file\n"
+            "`/export` the whole conversation as a Markdown file\n"
+            "**The session**\n"
             "`/stop` stop the current request and drop waiting ones (`!stop` does the same)\n"
+            "`/undo` take back the last request and its file changes, `/redo` bring it back\n"
             "`/new` start a fresh session in the same thread\n"
-            "`/compact` replace the conversation so far with a summary to free up context\n\n"
+            "`/compact` replace the conversation so far with a summary to free up context\n"
+            "`/fork` open a new thread that carries on from here\n"
+            "`/rename` rename the thread and its session\n"
+            "**Running**\n"
+            "`/shell` run a shell command in the checkout. The agent sees the output too.\n"
+            "`/command` run one of the agent's own commands, such as `review`\n\n"
             "**In the main channel** `/model`, `/effort` and `/agent` set what new threads start with, "
-            "and `/status` shows those defaults.",
+            "and `/status` shows those defaults. The rest work inside a thread.",
         )
 
     # ------------------------------------------------------------ controls
@@ -384,6 +725,277 @@ def setup(tree, ctx):
         ctx.queue.submit(interaction.channel_id, job)
         await say(interaction, "Compacting this thread's conversation" + (" after the current request." if waiting else "."))
 
+    # ------------------------------------------------------------ undo and redo
+
+    async def undo_target(entry):
+        """(the request /undo would take back, the file changes it made), or (None, [])."""
+        session, messages = await session_and_messages(entry)
+        requests = [m for m in live_messages(messages, session)[0] if is_request(m)]
+        if not requests:
+            return None, []
+        target = requests[-1]
+        changes = await ctx.agent.diff(entry["sessionId"], entry["directory"], target["info"]["id"])
+        return target, changes or []
+
+    @tree.command(name="undo", description="Take back the last request in this thread, with the file changes it made.")
+    @app_commands.guild_only()
+    async def undo(interaction: discord.Interaction):
+        entry = await thread_entry(interaction)
+        if entry is None:
+            return
+        if not entry.get("sessionId"):
+            return await refuse(interaction, "There is nothing to undo yet.")
+        if ctx.queue.load(interaction.channel_id):
+            return await refuse(interaction, busy)
+        await interaction.response.defer(ephemeral=True)
+        target, changes = await undo_target(entry)
+        if target is None:
+            return await interaction.followup.send("There is nothing left to undo in this session.", ephemeral=True)
+        # Asked first: the files go back for everyone, and other threads share them.
+        await interaction.followup.send(
+            undo_question(target, changes),
+            view=confirm_view(target["info"]["id"]),
+            ephemeral=True,
+            allowed_mentions=NO_MENTIONS,
+        )
+
+    async def undo_clicked(interaction, message_id):
+        where, entry = await scope_of(interaction)
+        if where != "thread" or not entry.get("sessionId"):
+            return await interaction.response.edit_message(content="This thread has nothing to undo any more.", view=None)
+        if ctx.queue.load(interaction.channel_id):
+            return await interaction.response.edit_message(content=busy, view=None)
+        await interaction.response.edit_message(content="Undoing…", view=None)
+        note(interaction, "undo")
+        channel, who = channel_of(interaction), name_of(interaction.user)
+
+        async def job():
+            try:
+                target, changes = await undo_target(entry) if entry.get("sessionId") else (None, [])
+                if target is None or target["info"]["id"] != message_id:
+                    return await ctx.send(
+                        channel, "Nothing was undone: this thread changed after the undo was asked for. Use `/undo` again."
+                    )
+                await ctx.agent.revert(entry["sessionId"], entry["directory"], message_id)
+                files = f" Files put back: {file_names(changes)}." if changes else " It had changed no files."
+                await ctx.send(
+                    channel,
+                    f"↩️ **{who}** undid the last request, “{snippet(asked(target)[1])}”.{files} "
+                    "`/redo` brings it back until the next message is sent.",
+                )
+            except Exception as err:
+                await ctx.report_failure(channel, err)
+
+        ctx.queue.submit(interaction.channel_id, job)
+
+    @tree.command(name="redo", description="Bring back what /undo took back, with its file changes.")
+    @app_commands.guild_only()
+    async def redo(interaction: discord.Interaction):
+        entry = await thread_entry(interaction)
+        if entry is None:
+            return
+        if not entry.get("sessionId"):
+            return await refuse(interaction, nothing_to_redo)
+        if ctx.queue.load(interaction.channel_id):
+            return await refuse(interaction, busy)
+        await interaction.response.defer()
+        note(interaction, "redo")
+        channel, who = channel_of(interaction), name_of(interaction.user)
+        answer = later(interaction, channel)
+
+        async def job():
+            try:
+                session, messages = await session_and_messages(entry)
+                if not (session or {}).get("revert"):
+                    return await answer(nothing_to_redo)
+                live, _ = live_messages(messages, session)
+                back = sum(1 for m in messages[len(live) :] if is_request(m))
+                await ctx.agent.unrevert(entry["sessionId"], entry["directory"])
+                await answer(f"↪️ **{who}** brought back {plural(back, 'request')} taken back with `/undo`, file changes included.")
+            except Exception as err:
+                log.error("thread %s: /redo failed: %s", interaction.channel_id, err)
+                await answer(f"Something went wrong on my side: {str(err)[:300]}")
+
+        # Queued so no message starts a request while the files are put back.
+        ctx.queue.submit(interaction.channel_id, job)
+
+    # ------------------------------------------------------------ fork and rename
+
+    @tree.command(name="fork", description="Open a new thread that carries on from here with a copy of the conversation.")
+    @app_commands.guild_only()
+    async def fork(interaction: discord.Interaction):
+        entry = await thread_entry(interaction)
+        if entry is None:
+            return
+        if not entry.get("sessionId"):
+            return await refuse(interaction, "There is nothing to fork yet. Send a message first.")
+        channel, who, user_id = channel_of(interaction), name_of(interaction.user), interaction.user.id
+        source_id = interaction.channel_id
+        name = fork_name(getattr(channel, "name", None))
+
+        async def job():
+            session_id = entry.get("sessionId")
+            if not session_id:
+                return await ctx.send(channel, "There is nothing to fork: this thread has a fresh session.")
+            try:
+                session = await ctx.agent.session(session_id, entry["directory"])
+                # Requests taken back with /undo stay behind.
+                before = ((session or {}).get("revert") or {}).get("messageID")
+                forked = await ctx.agent.fork(session_id, entry["directory"], before)
+                thread = await ctx.open_thread(name, f"🍴 **{who}** forked <#{source_id}> into a new thread.")
+                copy = ctx.store.register_thread(thread.id, user_id)
+                for setting in SETTINGS:
+                    set_setting(copy, setting, entry.get(setting))
+                copy["sessionId"] = forked["id"]
+                ctx.store.save()
+                log.info("thread %s: forked into thread %s, session %s", source_id, thread.id, forked["id"])
+                with contextlib.suppress(Exception):
+                    await ctx.agent.rename(forked["id"], entry["directory"], session_title(name))
+                await ctx.send(
+                    thread,
+                    f"This thread carries on from <#{source_id}> with a copy of its conversation and settings. "
+                    "From here the two go their own ways, but both work in the same checkout.",
+                )
+                await ctx.send(channel, f"🍴 Forked into <#{thread.id}>.")
+            except Exception as err:
+                await ctx.report_failure(channel, err)
+
+        note(interaction, "fork")
+        waiting = queued(interaction)
+        # Queued so the copy never catches a request half done.
+        ctx.queue.submit(interaction.channel_id, job)
+        await say(interaction, f"Forking this thread{waiting}.")
+
+    @tree.command(name="rename", description="Rename this thread and its OpenCode session.")
+    @app_commands.describe(name="The new name")
+    @app_commands.guild_only()
+    async def rename(interaction: discord.Interaction, name: str):
+        entry = await thread_entry(interaction)
+        if entry is None:
+            return
+        name = " ".join(name.split())[:100]
+        if not name:
+            return await refuse(interaction, "The new name can't be empty.")
+        await interaction.response.defer()
+        note(interaction, "rename")
+        thread = channel_of(interaction)
+        try:
+            if not hasattr(thread, "edit"):
+                thread = await interaction.client.fetch_channel(interaction.channel_id)
+            await asyncio.wait_for(thread.edit(name=name), RENAME_WAIT)
+        except TimeoutError:
+            return await interaction.followup.send(
+                "Discord allows only two renames of a thread every ten minutes. Try again in a few minutes.",
+                allowed_mentions=NO_MENTIONS,
+            )
+        except discord.HTTPException as err:
+            return await interaction.followup.send(f"Discord did not let me rename this thread: {err}", allowed_mentions=NO_MENTIONS)
+        if entry.get("sessionId"):
+            try:
+                await ctx.agent.rename(entry["sessionId"], entry["directory"], session_title(name))
+            except Exception as err:
+                log.warning("thread %s: could not rename session: %s", interaction.channel_id, err)
+        await interaction.followup.send(f"Renamed this thread to **{quoted(name)}**.", allowed_mentions=NO_MENTIONS)
+
+    # ------------------------------------------------------------ running things
+
+    @tree.command(name="shell", description="Run a shell command in the checkout. The agent sees the output too.")
+    @app_commands.describe(command="The command, as you would type it in a terminal")
+    @app_commands.guild_only()
+    async def shell(interaction: discord.Interaction, command: str):
+        entry = await thread_entry(interaction)
+        if entry is None:
+            return
+        command = command.strip()
+        if not command:
+            return await refuse(interaction, "Tell me which command to run.")
+        channel = channel_of(interaction)
+
+        async def job():
+            typing = asyncio.create_task(ctx.keep_typing(channel))
+            session_id = None
+            try:
+                session_id = await ctx.ensure_session(channel, entry)
+                snapshot = await ctx.catalog.get()
+                options, _ = snapshot.resolve(settings_of(entry))
+                message = await ctx.agent.shell(
+                    session_id,
+                    entry["directory"],
+                    options.get("agent") or snapshot.default_agent,
+                    command,
+                    ctx.shell_timeout,
+                    options.get("model"),
+                )
+                output, error = shell_result(message)
+                if error:
+                    return await ctx.send(channel, f"The command could not run: {plain(error, 500)}")
+                text, full = shell_message(output)
+                await ctx.send(channel, text, file_of(full.encode(), "output.txt") if full else None)
+            except TimeoutError:
+                if session_id:
+                    with contextlib.suppress(Exception):
+                        await ctx.agent.abort(session_id, entry["directory"])
+                minutes = round(ctx.shell_timeout / 60)
+                await ctx.send(channel, f"The command was still running after {minutes} minutes, so I stopped it.")
+            except Exception as err:
+                await ctx.report_failure(channel, err)
+            finally:
+                typing.cancel()
+
+        note(interaction, "shell")
+        waiting = queued(interaction)
+        ctx.queue.submit(interaction.channel_id, job)
+        await say(interaction, f"🖥️ **{name_of(interaction.user)}** runs `{plain(command, 300)}`{waiting}.")
+
+    async def command_choices(interaction: discord.Interaction, typed: str):
+        snapshot = await ctx.catalog.get()
+        pairs = [(f"{name}: {text}" if text else name, name) for name, text in snapshot.commands.items()]
+        return matching_choices(pairs, typed)
+
+    @tree.command(name="command", description="Run one of the agent's own commands or skills, such as review.")
+    @app_commands.describe(name="The command to run", arguments="What to pass to it, if anything")
+    @app_commands.autocomplete(name=command_choices)
+    @app_commands.guild_only()
+    async def command_(interaction: discord.Interaction, name: str, arguments: str = ""):
+        entry = await thread_entry(interaction)
+        if entry is None:
+            return
+        snapshot = await ctx.catalog.get()
+        name = name.strip().removeprefix("/")
+        if name not in snapshot.commands:
+            listing = ", ".join(f"`{known}`" for known in snapshot.commands) or "none"
+            return await refuse(interaction, f"The agent has no command called {quoted(name)}. Available: {listing}.")
+        arguments = arguments.strip()
+        channel = channel_of(interaction)
+
+        async def job():
+            try:
+                await ctx.run_command(channel, entry, name, arguments)
+            except Exception as err:
+                await ctx.report_failure(channel, err)
+
+        note(interaction, f"command {name}")
+        waiting = queued(interaction)
+        ctx.queue.submit(interaction.channel_id, job)
+        shown = f"/{name} {plain(arguments, 300)}".rstrip()
+        await say(interaction, f"▶️ **{name_of(interaction.user)}** runs `{shown}`{waiting}.")
+
+    # ------------------------------------------------------------ buttons
+
+    async def on_component(interaction):
+        """A button under one of these commands' messages was clicked. Returns False if it is not one."""
+        custom_id = (interaction.data or {}).get("custom_id") or ""
+        if not custom_id.startswith(BUTTON_PREFIX):
+            return False
+        action, _, value = custom_id.removeprefix(BUTTON_PREFIX).partition(":")
+        if action == "undo" and value:
+            await undo_clicked(interaction, value)
+        elif action == "cancel":
+            await interaction.response.edit_message(content="Cancelled. Nothing was undone.", view=None)
+        else:
+            await interaction.response.edit_message(content="This button no longer works.", view=None)
+        return True
+
     @tree.error
     async def on_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
         name = interaction.command.name if interaction.command else "?"
@@ -394,3 +1006,5 @@ def setup(tree, ctx):
                 await interaction.followup.send(text, ephemeral=True)
             else:
                 await interaction.response.send_message(text, ephemeral=True)
+
+    return on_component
