@@ -21,6 +21,8 @@ POLL_SECONDS = 20
 # A session that has shown no activity this long after its prompt went out, and
 # is not working, is taken to have ended without the stream saying so.
 START_GRACE_SECONDS = 10
+# The agent sends a file to its thread with this tool (opencode-agent/tool/discord_attach.ts).
+ATTACH_TOOL = "discord_attach"
 
 
 def tool_detail(tool, state):
@@ -37,6 +39,7 @@ def tool_detail(tool, state):
         "websearch": "query",
         "task": "description",
         "skill": "name",
+        "discord_attach": "path",
     }
     value = given.get(keys.get(tool, ""))
     if not isinstance(value, str) or not value.strip():
@@ -68,6 +71,7 @@ class Turn:
         self.text = ""  # what the agent is writing right now
         self.tokens = None  # size of the conversation after the latest step
         self.tools = {}  # part id -> {"tool", "status", "detail"}, in the order first seen
+        self.attached = []  # files marked with discord_attach, subagents' included, in call order
         self._roles = {}  # message id -> role
         self._parts = {}  # part id -> type
         self._paused = 0  # open questions: the clock stops while a person is being waited on
@@ -184,6 +188,8 @@ class Turn:
         if kind == "tool":
             state = part.get("state") or {}
             tool = self.tools.setdefault(part.get("id"), {"tool": part.get("tool") or "tool", "detail": ""})
+            if tool.get("status") != "completed" and attached_path(part):  # each call once
+                self.attached.append(attached_path(part))
             tool["status"] = state.get("status")
             tool["detail"] = tool_detail(tool["tool"], state) or tool["detail"]
             self.changed.set()
@@ -360,12 +366,43 @@ def request_text(message):
     return " ".join(parts_text(message.get("parts")).split())
 
 
+def attached_path(part):
+    """The file a finished discord_attach call marked, relative to the session's folder, or None.
+
+    The tool (opencode-agent/tool/discord_attach.ts) checks the file and puts
+    the path in its metadata. A call it refused ended with an error instead.
+    """
+    if part.get("type") != "tool" or part.get("tool") != ATTACH_TOOL:
+        return None
+    state = part.get("state") or {}
+    path = (state.get("metadata") or {}).get("attach")
+    return path if state.get("status") == "completed" and isinstance(path, str) and path else None
+
+
+def subagent_session(part):
+    """The session a subagent (the task tool) ran in, or None."""
+    if part.get("type") != "tool" or part.get("tool") != "task":
+        return None
+    session_id = ((part.get("state") or {}).get("metadata") or {}).get("sessionId")
+    return session_id if isinstance(session_id, str) else None
+
+
 def turn_reply(messages, user_message_id=None):
     """(text, error) of one request in a session's recent messages, oldest first.
 
-    A request produces several agent messages, one per step. The answer is
-    the text of the last one. `error` is that message's error, if it has one.
+    The answer is the text of the request's last step (see turn_steps).
+    `error` is that message's error, if it has one.
+    """
+    steps = turn_steps(messages, user_message_id)
+    if not steps:
+        return "", None
+    return parts_text(steps[-1].get("parts")), steps[-1]["info"].get("error")
 
+
+def turn_steps(messages, user_message_id=None):
+    """The agent's messages for one request, in a session's recent messages, oldest first.
+
+    A request produces several agent messages, one per step.
     `user_message_id` is the message the request became. Without it (the
     bridge restarted mid-request) the latest request is used.
     """
@@ -383,6 +420,4 @@ def turn_reply(messages, user_message_id=None):
             break  # the next request
         if (message.get("info") or {}).get("role") == "assistant":
             steps.append(message)
-    if not steps:
-        return "", None
-    return parts_text(steps[-1].get("parts")), steps[-1]["info"].get("error")
+    return steps

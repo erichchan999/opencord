@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+from urllib.parse import quote
 
 import aiohttp
 
@@ -19,6 +20,14 @@ class OpenCodeError(Exception):
     def __init__(self, message, status):
         super().__init__(message)
         self.status = status
+
+
+class FileTooLarge(Exception):
+    """A file read from the agent is over the size asked for."""
+
+    def __init__(self, size):
+        super().__init__(f"{size} bytes")
+        self.size = size
 
 
 class EventParser:
@@ -84,6 +93,33 @@ class OpenCode:
             return json.loads(text)
         except ValueError:
             return text
+
+    async def read_file(self, directory, path, limit, timeout=60):
+        """The bytes of a file, `path` being relative to `directory`.
+
+        The server refuses a path that leads outside `directory`, a symlink
+        that does, a folder and a missing file, all with an error status.
+        A file over `limit` bytes is refused here, before it is read.
+        (GET /file/content is no use for this: it trims the whitespace around
+        a text file and fails on some binary ones.)
+        """
+        try:
+            async with self._http.get(
+                f"{self._url}/api/fs/read/{quote(path)}",
+                params={"location[directory]": directory},
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as res:
+                if res.status >= 400:
+                    text = await res.text()
+                    raise OpenCodeError(f"reading {path} -> {res.status}: {text[:200]}", res.status)
+                if (res.content_length or 0) > limit:
+                    raise FileTooLarge(res.content_length)
+                data = await res.read()
+        except TimeoutError:
+            raise TimeoutError(f"reading {path} timed out after {round(timeout)}s") from None
+        if len(data) > limit:
+            raise FileTooLarge(len(data))
+        return data
 
     async def wait_until_ready(self):
         attempt = 0

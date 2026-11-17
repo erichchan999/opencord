@@ -20,6 +20,8 @@
   sends them with every prompt.
 - Text files attached to a message are sent to the agent as their content.
   Other attachments are passed as links.
+- Files the agent sends with its discord_attach tool are posted after its
+  reply (attachments.py).
 - A prompt is handed to the agent and the work is then followed on the agent's
   event stream (events.py). While it runs, one status message in the thread
   shows what the agent is doing (status.py), and the agent's questions appear
@@ -51,10 +53,11 @@ import discord
 from discord import app_commands
 
 import access
+import attachments
 import commands
 import events
 from catalog import Catalog, model_key
-from events import Router, parts_text, turn_reply, wait_for_turn
+from events import Router, parts_text, turn_reply, turn_steps, wait_for_turn
 from opencode import OpenCode, OpenCodeError
 from questions import Questions
 from state import Store, set_setting, settings_of
@@ -808,7 +811,7 @@ async def finish_turn(thread, entry, turn, status, outcome, call=None):
             halted = False
             log.error("thread %s: could not stop session %s: %s", thread.id, turn.session_id, err)
 
-    reply, error, unread = "", None, None
+    reply, error, unread, steps = "", None, None, []
     answer = await call_answer(call)
     try:
         if answer is not None:
@@ -817,6 +820,7 @@ async def finish_turn(thread, entry, turn, status, outcome, call=None):
             pass  # the request failed before it reached the session: turn.error says why
         else:
             messages = await agent.recent_messages(turn.session_id, entry["directory"], REPLY_MESSAGES)
+            steps = turn_steps(messages, turn.user_message_id)
             reply, error = turn_reply(messages, turn.user_message_id)
     except Exception as err:
         unread = err
@@ -841,6 +845,12 @@ async def finish_turn(thread, entry, turn, status, outcome, call=None):
 
     if reply:
         await send_long(thread, reply)
+    # Files the agent sent with discord_attach, also from a request stopped
+    # part way: they exist already. The events miss calls made before a
+    # restart, and the messages read miss calls from long ago in a long request.
+    marked = turn.attached + await attachments.marked_in(steps, agent, entry["directory"])
+    if marked:
+        await attachments.post(thread, agent, entry["directory"], marked)
     carry_on = "Anything it changed so far is still in the sandbox. Send another message to carry on."
     if result == "timeout" and halted:
         await send(thread, f"I stopped this request because it ran for more than {minutes} minutes. {carry_on}")

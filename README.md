@@ -68,6 +68,7 @@ The bridge and the proxy each read only their own file in `secrets/`, so neither
 - **One sandbox:** every thread works in the same folder, `/work/sandbox`, so two threads editing the same files at once can collide. It isn't a git repo, and the agent has no GitHub credentials.
 - **Parallel threads:** up to `MAX_CONCURRENT` (default 16) threads run at once. Within a thread, messages run one at a time, in order.
 - **Attachments:** text files go to the agent as their content, up to 100 KB each. Other files are passed as links.
+- **Files back:** ask the agent for a file and it attaches it after its reply, up to 8 MB each.
 - **Questions:** the agent's questions appear with buttons. Anyone in the thread can answer, and the request's time limit is paused meanwhile.
 - **Stop:** `!stop` or `/stop` stops the running request and drops the thread's waiting messages.
 - **Side chat:** a message in a thread that starts with `//` is ignored, so people can talk there without the agent picking it up.

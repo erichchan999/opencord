@@ -26,13 +26,13 @@ class Channel:
         self.fail_edit = None  # an exception for edit() to raise
         self._next_id = 9000
 
-    async def send(self, content=None, *, view=None, file=None, allowed_mentions=None, suppress_embeds=False):
+    async def send(self, content=None, *, view=None, file=None, files=None, allowed_mentions=None, suppress_embeds=False):
         if self.fail_sends:
             raise discord.HTTPException(types.SimpleNamespace(status=500, reason="boom"), "boom")
         self._next_id += 1
         self.sent.append((self._next_id, content, view))
-        if file is not None:
-            self.files.append((self._next_id, file.filename, file.fp.getvalue()))
+        for one in ([file] if file is not None else []) + list(files or []):
+            self.files.append((self._next_id, one.filename, one.fp.getvalue()))
         return types.SimpleNamespace(id=self._next_id)
 
     async def edit(self, *, name):

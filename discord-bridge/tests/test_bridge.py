@@ -37,6 +37,7 @@ class Agent:
         self.created = []
         self.renamed = []
         self.deleted = []  # (session id, sessions aborted before it)
+        self.files = {}  # path in the sandbox -> bytes, for read_file
         self.aborted = []
         self.rejected = []
         self.on_abort = None
@@ -50,6 +51,11 @@ class Agent:
 
     async def rename(self, session_id, directory, title):
         self.renamed.append((session_id, title))
+
+    async def read_file(self, directory, path, limit):
+        if path not in self.files:
+            raise OpenCodeError(f"reading {path} -> 500", 500)
+        return self.files[path]
 
     async def delete_session(self, session_id, directory):
         # With what had been aborted by then, to check the order.
@@ -220,6 +226,56 @@ def test_a_thread_moved_to_the_sandbox_says_so_on_its_next_message(world):
 
     asyncio.run(bridge.run_turn(world.thread, world.entry, AUTHOR, "and again"))
     assert sum("shared sandbox" in text for text in world.thread.texts()) == 1
+
+
+def attaching(session, *paths, text="Here they are."):
+    """A request in which the agent marks `paths` with discord_attach, then replies."""
+    parts = [
+        {"id": f"prt_{n}", "messageID": "msg_a", "type": "tool", "tool": "discord_attach", "callID": f"call_{n}",
+         "state": {"status": "completed", "input": {"path": path}, "metadata": {"attach": path, "size": 3}}}
+        for n, path in enumerate(paths)
+    ]
+    parts.append({"id": "prt_text", "messageID": "msg_a", "type": "text", "text": text})
+    return [
+        event("session.status", session, status={"type": "busy"}),
+        event("message.updated", session, info={"id": "msg_u", "role": "user"}),
+        event("message.updated", session, info={"id": "msg_a", "role": "assistant", "parentID": "msg_u"}),
+        *(event("message.part.updated", session, part=part) for part in parts),
+        event("session.idle", session),
+    ]
+
+
+def test_files_the_agent_marked_follow_its_reply(world):
+    session = world.agent.session_id
+    world.agent.stream = attaching(session, "out/chart.png", "report.md", "out/chart.png")
+    world.agent.messages = messages_from(world.agent.stream, session)
+    world.agent.files = {"out/chart.png": b"\x89PNG", "report.md": b"# Report\n"}
+    asyncio.run(asyncio.wait_for(bridge.run_turn(world.thread, world.entry, AUTHOR, "make a chart"), 2))
+    assert world.thread.texts()[1] == "Here they are."
+    ((files_id, _, _),) = [sent for sent in world.thread.sent if sent[1] is None]
+    assert [(mid, name, data) for mid, name, data in world.thread.files] == [
+        (files_id, "report.md", b"# Report\n"), (files_id, "chart.png", b"\x89PNG"),  # each once, the last call's place
+    ]
+    assert len(world.thread.sent) == 3  # status, reply, files: nothing left out
+
+
+def test_a_file_that_cannot_be_fetched_gets_a_note_and_the_reply_still_posts(world):
+    session = world.agent.session_id
+    world.agent.stream = attaching(session, "gone.txt")
+    world.agent.messages = messages_from(world.agent.stream, session)
+    asyncio.run(asyncio.wait_for(bridge.run_turn(world.thread, world.entry, AUTHOR, "send it"), 2))
+    assert world.thread.texts()[1:] == ["Here they are.", "Not attached: `gone.txt` could not be fetched from the agent."]
+
+
+def test_after_a_restart_files_marked_before_it_still_follow_the_reply(world):
+    session = world.agent.session_id
+    world.entry.update(sessionId=session, turn={"statusMessageId": 4242, "startedAt": time.time(), "label": ""})
+    # The request finished while the bridge was down: no events, only the session's messages.
+    world.agent.messages = messages_from(attaching(session, "out/log.txt"), session)
+    world.agent.files = {"out/log.txt": b"all good\n"}
+    asyncio.run(asyncio.wait_for(bridge.resume_turn(str(THREAD), world.entry), 2))
+    assert [(name, data) for _, name, data in world.thread.files] == [("log.txt", b"all good\n")]
+    assert world.thread.texts()[0] == "Here they are."
 
 
 def test_a_request_that_runs_too_long_is_stopped(world, monkeypatch):

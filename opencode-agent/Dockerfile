@@ -19,13 +19,16 @@ COPY opencode-agent/opencode.json /etc/opencode/opencode.json
 # OpenCode adds the global AGENTS.md to every session's instructions, next to
 # the working repo's own. It tells the agent about this system.
 COPY opencode-agent/system-prompt.md /home/node/.config/opencode/AGENTS.md
+# Custom tools: discord_attach sends a file to the Discord thread. OpenCode
+# installs @opencode-ai/plugin, which it imports, into this folder at start.
+COPY opencode-agent/tool/ /home/node/.config/opencode/tool/
 
 # Normalise line endings (files may be edited on Windows), lock down the
 # root-owned scripts and config, and pre-create volume mount points owned by
 # the unprivileged user so fresh named volumes inherit that ownership.
-RUN sed -i 's/\r$//' /usr/local/bin/*.sh /etc/opencode/opencode.json \
+RUN sed -i 's/\r$//' /usr/local/bin/*.sh /etc/opencode/opencode.json /home/node/.config/opencode/tool/*.ts \
  && chmod 755 /usr/local/bin/*.sh \
- && chmod 644 /etc/opencode/opencode.json /home/node/.config/opencode/AGENTS.md \
+ && chmod 644 /etc/opencode/opencode.json /home/node/.config/opencode/AGENTS.md /home/node/.config/opencode/tool/*.ts \
  && mkdir -p /work /home/node/.local/share/opencode /home/node/.config /home/node/.cache \
  && chown -R node:node /work /home/node
 
