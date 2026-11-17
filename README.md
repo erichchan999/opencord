@@ -1,13 +1,13 @@
 # opencord
 
-opencord is a Discord front end to [OpenCode](https://opencode.ai). @mention the bot in its channel and it opens a thread with its own OpenCode session, which works on a GitHub repo of your choice: reading and changing code, running commands and opening pull requests. Slash commands control each thread's model, effort and session. Everything runs in Docker, with DeepSeek as the model provider.
+opencord is a Discord front end to [OpenCode](https://opencode.ai). @mention the bot in an enabled channel and it opens a thread with its own OpenCode session, which works on a GitHub repo of your choice: reading and changing code, running commands and opening pull requests. Slash commands control each thread's model, effort and session. Everything runs in Docker, with DeepSeek as the model provider.
 
 ## How it fits together
 
 | Container | Holds | Does |
 | --- | --- | --- |
 | `discord-bridge` | Discord bot token | Accepts input from enabled channels, opens threads, and passes messages and slash commands to the agent's API. Follows the agent's event stream for live progress and questions. |
-| `opencode-agent` | Scoped GitHub token | Runs `opencode serve` in a clone of the repo. Anyone in the bot's channel effectively controls this container. |
+| `opencode-agent` | Scoped GitHub token | Runs `opencode serve` in a clone of the repo. Anyone who can post in an enabled channel effectively controls this container. |
 | `llm-proxy` | DeepSeek API key | Forwards only chat completions and the model list to DeepSeek, adds the real key, and limits the agent to 240 requests a minute. |
 
 The containers run in the `opencord` compose project. Each one reads its own file in `secrets/`, so none of them sees another's keys. The one shared value is the OpenCode server password in `shared.env`, which the bridge uses to call the agent.
@@ -113,7 +113,7 @@ Each deploy labels every container `opencord.revision` with this folder's commit
 
 ## Using it
 
-- **New request:** @mention the bot in its channel. It opens a thread with a new OpenCode session.
+- **New request:** @mention the bot in an enabled channel. It opens a thread with a new OpenCode session.
 - **Follow-ups:** a message in that thread continues the same session while its parent channel is enabled. Disabling the parent blocks new input and question answers, and queued input is checked again before it runs. Work already running can finish, and `!stop` or `/stop` still stops it.
 - **One checkout:** every thread works in the same clone, `/work/repo`. Two threads editing the same files at the same time can collide. The bridge makes no branches, so ask the agent for one when a change needs it.
 - **Parallel threads:** up to `MAX_CONCURRENT` threads run at once, and further requests wait in a queue. Within a thread, messages run one at a time, in order.

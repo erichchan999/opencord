@@ -932,7 +932,7 @@ async def on_guild_join(guild):
 
 
 async def prepare_server(guild):
-    """Logs where the bot works in `guild` and registers the slash commands there."""
+    """Logs the enabled channels in `guild` and registers the slash commands there."""
     enabled = [channel for channel in guild.text_channels if access.enabled(channel, CHANNEL_IDS)]
     if not enabled:
         log.warning("%s: no enabled channels. Check DISCORD_CHANNEL_IDS and the bot's View Channel permission.", guild.name)

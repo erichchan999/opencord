@@ -3,8 +3,8 @@
 The commands are registered to every server the bot is in. Session commands
 work only in enabled channels and the threads the bot opened there.
 Inside one of the bridge's threads they act on that thread. /model, /effort
-and /agent used in the main channel set what new threads start with, in every
-channel the bot works in.
+and /agent used in an enabled channel (outside a thread) set what new threads
+start with, in every enabled channel.
 
 A change is answered publicly, so everyone in the thread sees it. Lookups and
 refusals are shown only to the person who ran the command.
@@ -56,7 +56,7 @@ class Context:
     queue: Any  # bridge.ThreadQueue
     compact_timeout: float
     shell_timeout: float
-    home_of: Callable  # async (channel) -> the channel the bot works under (itself or a thread's parent), or None
+    home_of: Callable  # async (channel) -> its enabled text channel (itself or a thread's parent), or None
     stop_thread: Callable  # async (thread_id, entry, stop_point)
     send: Callable  # async (channel, text, file=None)
     report_failure: Callable  # async (channel, error)
