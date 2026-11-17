@@ -26,6 +26,8 @@
   with buttons (questions.py).
 - A request that was running when the bridge stopped is picked back up when it
   starts again.
+- A thread deleted in Discord, even while the bridge was down, is forgotten
+  and its session deleted.
 
 This container holds the Discord bot token. It runs nothing itself: prompts,
 /shell and the other session commands go to the agent's HTTP API, and the
@@ -463,6 +465,46 @@ async def stop_thread(thread_id, entry, stop_point):
     if entry.get("sessionId"):
         with contextlib.suppress(Exception):
             await agent.abort(entry["sessionId"], entry["directory"])
+
+
+async def forget_thread(thread_id, entry):
+    """Drops a thread that was deleted in Discord: its work, its entry and its session."""
+    log.info("thread %s was deleted: forgetting it", thread_id)
+    await stop_thread(thread_id, entry, queue.stop_point())
+    store.threads.pop(str(thread_id), None)
+    store.save()
+
+    async def delete_session():
+        # Read here, after the stopped request wrote up its outcome, in case it made the session.
+        session_id = entry.get("sessionId")
+        if not session_id:
+            return
+        try:
+            await agent.delete_session(session_id, entry["directory"])
+            log.info("thread %s: deleted session %s", thread_id, session_id)
+        except Exception as err:
+            log.warning("thread %s: could not delete session %s: %s", thread_id, session_id, err)
+
+    # Queued behind the stopped request, the way /clear deletes an old session.
+    queue.submit(thread_id, delete_session, droppable=False)
+
+
+async def forget_deleted_threads():
+    """Forgets threads Discord no longer has: deleted while the bridge was down, or
+    with their channel. Runs after login, and when a channel is deleted."""
+    for thread_id, entry in list(store.threads.items()):
+        if client.get_channel(int(thread_id)) is not None:
+            continue  # known to Discord right now
+        try:
+            await client.fetch_channel(int(thread_id))
+        except discord.NotFound:
+            if store.threads.get(thread_id) is entry:  # not forgotten meanwhile
+                await forget_thread(int(thread_id), entry)
+        except discord.HTTPException as err:
+            # Forbidden, or Discord having trouble: the thread may well still be there.
+            log.debug("thread %s: could not check it: %s", thread_id, err)
+        except Exception:
+            log.exception("thread %s: could not check whether it still exists", thread_id)
 
 
 async def prompt_settings(thread, entry):
@@ -985,6 +1027,21 @@ async def on_message(message):
 
 
 @client.event
+async def on_raw_thread_delete(payload):
+    # The raw event, so it also fires for threads missing from discord.py's cache.
+    entry = store.threads.get(str(payload.thread_id))
+    if entry is not None:
+        await forget_thread(payload.thread_id, entry)
+
+
+@client.event
+async def on_guild_channel_delete(channel):
+    # A deleted channel takes its threads with it, with no event for each one.
+    if isinstance(channel, discord.TextChannel) and store.threads:
+        in_background(forget_deleted_threads())
+
+
+@client.event
 async def on_interaction(interaction):
     # Slash commands are handled by the command tree. This is for the buttons
     # and menus under the agent's questions, and the ones /undo shows.
@@ -1042,6 +1099,7 @@ async def on_ready():
     log.info("logged in as %s", client.user)
     # Questions asked while the bridge was down have no buttons yet.
     in_background(check_questions())
+    in_background(forget_deleted_threads())
     if not client.guilds:
         log.warning("not in any server yet. Invite the bot with the link in the README.")
     for guild in client.guilds:

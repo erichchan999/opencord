@@ -14,7 +14,7 @@ import pytest
 
 import bridge
 import events
-from fakes import Channel
+from fakes import Channel, Missing
 from opencode import OpenCodeError
 from sample import FLASH, messages_from, recorded, root_session, snapshot
 
@@ -36,6 +36,7 @@ class Agent:
         self.prompts = []
         self.created = []
         self.renamed = []
+        self.deleted = []  # (session id, sessions aborted before it)
         self.aborted = []
         self.rejected = []
         self.on_abort = None
@@ -49,6 +50,10 @@ class Agent:
 
     async def rename(self, session_id, directory, title):
         self.renamed.append((session_id, title))
+
+    async def delete_session(self, session_id, directory):
+        # With what had been aborted by then, to check the order.
+        self.deleted.append((session_id, list(self.aborted)))
 
     async def prompt_async(self, session_id, directory, body):
         if session_id in self.missing:
@@ -395,6 +400,104 @@ def test_a_stop_drops_waiting_jobs_but_not_ones_that_must_run():
         assert ran == ["delete old session"]
 
     asyncio.run(asyncio.wait_for(run(), 2))
+
+
+async def until_idle(thread_id=THREAD):
+    while bridge.queue.load(thread_id):
+        await asyncio.sleep(0.01)
+
+
+def test_deleting_a_thread_forgets_it_and_deletes_its_session(world, monkeypatch):
+    monkeypatch.setattr(bridge, "queue", bridge.ThreadQueue(4))
+    world.entry["sessionId"] = "ses_1"
+    bridge.store.questions["que_1"] = {"thread": str(THREAD), "questions": [{"question": "Which?", "options": []}], "answers": [None], "messages": [77], "askedAt": time.time()}
+
+    async def run():
+        await bridge.on_raw_thread_delete(types.SimpleNamespace(thread_id=THREAD))
+        await until_idle()
+
+    asyncio.run(asyncio.wait_for(run(), 2))
+    assert str(THREAD) not in bridge.store.threads and bridge.store.questions == {}
+    assert world.agent.rejected == ["que_1"] and [sid for sid, _ in world.agent.deleted] == ["ses_1"]
+    saved = bridge.Store(bridge.STATE_FILE, bridge.BASE_DIR)
+    saved.load()
+    assert str(THREAD) not in saved.threads
+
+
+def test_deleting_a_thread_the_bridge_does_not_own_does_nothing(world, monkeypatch):
+    monkeypatch.setattr(bridge, "queue", bridge.ThreadQueue(4))
+    asyncio.run(bridge.on_raw_thread_delete(types.SimpleNamespace(thread_id=STRANGER)))
+    assert list(bridge.store.threads) == [str(THREAD)] and world.agent.deleted == world.agent.aborted == []
+
+
+def test_deleting_a_thread_mid_request_stops_it_before_its_session_goes(world, monkeypatch):
+    monkeypatch.setattr(bridge, "queue", bridge.ThreadQueue(4))
+    session = world.agent.session_id
+    world.agent.working = {session: {"type": "busy"}}
+    world.agent.stream = [event("session.status", session, status={"type": "busy"})]
+
+    def aborted():
+        world.agent.working = {}
+        bridge.router.dispatch(event("session.idle", session))
+
+    world.agent.on_abort = aborted
+
+    async def run():
+        bridge.queue.submit(THREAD, lambda: bridge.run_turn(world.thread, world.entry, AUTHOR, "a long job"))
+        while bridge.router.turn_for_thread(THREAD) is None:
+            await asyncio.sleep(0.01)
+        await bridge.on_raw_thread_delete(types.SimpleNamespace(thread_id=THREAD))
+        await until_idle()
+
+    asyncio.run(asyncio.wait_for(run(), 3))
+    assert world.agent.deleted == [(session, [session])]  # aborted first
+    assert str(THREAD) not in bridge.store.threads and bridge.router.turns == {}
+
+
+def test_threads_deleted_while_the_bridge_was_down_are_forgotten(world, monkeypatch):
+    monkeypatch.setattr(bridge, "queue", bridge.ThreadQueue(4))
+    for thread_id in (601, 602, 603):
+        bridge.store.register_thread(thread_id, 42)["sessionId"] = f"ses_{thread_id}"
+
+    class Client:
+        def get_channel(self, channel_id):
+            return world.thread if channel_id == THREAD else None  # the rest are archived, or gone
+
+        async def fetch_channel(self, channel_id):
+            if channel_id == 602:
+                raise Missing()
+            if channel_id == 603:
+                raise discord.Forbidden(types.SimpleNamespace(status=403, reason="no"), "Missing Access")
+            return Channel(channel_id)
+
+    monkeypatch.setattr(bridge, "client", Client())
+
+    async def run():
+        await bridge.forget_deleted_threads()
+        await until_idle(602)
+
+    asyncio.run(asyncio.wait_for(run(), 2))
+    assert sorted(bridge.store.threads) == [str(THREAD), "601", "603"]
+    assert [sid for sid, _ in world.agent.deleted] == ["ses_602"]
+
+
+def test_deleting_a_channel_checks_which_threads_went_with_it(world, monkeypatch):
+    checked = []
+
+    async def forget_deleted_threads():
+        checked.append(True)
+
+    monkeypatch.setattr(bridge, "forget_deleted_threads", forget_deleted_threads)
+
+    async def run(channel):
+        await bridge.on_guild_channel_delete(channel)
+        await asyncio.sleep(0)
+
+    asyncio.run(run(types.SimpleNamespace(id=CHANNEL)))  # not a text channel: a voice channel, say
+    assert checked == []
+    text_channel = discord.TextChannel.__new__(discord.TextChannel)
+    asyncio.run(run(text_channel))
+    assert checked == [True]
 
 
 def test_a_stop_that_beats_the_prompt_to_the_agent_is_sent_again(world):
