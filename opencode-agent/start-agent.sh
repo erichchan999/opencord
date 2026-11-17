@@ -5,14 +5,8 @@ set -eu
 
 # Defaults for any repo the agent clones or creates in the sandbox.
 git config --global user.name "${GIT_AUTHOR_NAME:-opencord}"
-git config --global user.email "${GIT_AUTHOR_EMAIL:-opencord@users.noreply.github.com}"
+git config --global user.email "${GIT_AUTHOR_EMAIL:-agent@opencord.invalid}"
 git config --global init.defaultBranch main
-
-# The repo clone from before the sandbox. One-time cleanup: drop this later.
-if [ -e /work/repo ]; then
-  echo "start-agent: removing the old repo clone at /work/repo"
-  rm -rf /work/repo
-fi
 
 # Every thread works here. It starts empty, is not a git repo and is kept across restarts.
 mkdir -p /work/sandbox

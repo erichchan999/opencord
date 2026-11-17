@@ -20,9 +20,16 @@ The bridge and the proxy each read only their own file in `secrets/`, so neither
 
 ## Setup
 
-1. **Docker:** install Docker Desktop (Windows, macOS) or Docker Engine with the compose plugin (Linux), and have it start at boot so the bot comes back after a reboot. On Windows, also see [Windows](#windows).
+1. **Docker:** install Docker Desktop (Windows, macOS) or Docker Engine with the compose plugin (Linux). It needs Docker Engine 28 or later, Compose 2.33.1 or later and at least 2 CPUs, and the agent can use up to 4 GB of memory. Set Docker to start on its own (in Docker Desktop, **Start Docker Desktop when you sign in**) so the bot comes back after a reboot.
 
-2. **Secrets:** copy the examples, then fill in each file.
+2. **Get the code:**
+
+   ```bash
+   git clone https://github.com/erichchan999/opencord.git
+   cd opencord
+   ```
+
+3. **Secrets:** copy the examples, then fill in each file.
 
    ```bash
    cp -r secrets.example secrets
@@ -31,12 +38,18 @@ The bridge and the proxy each read only their own file in `secrets/`, so neither
    | File | Set |
    | --- | --- |
    | `secrets/proxy.env` | `DEEPSEEK_API_KEY`, from platform.deepseek.com |
-   | `secrets/bridge.env` | `DISCORD_BOT_TOKEN` and `DISCORD_CHANNEL_IDS` (step 3). The limits under [Using it](#using-it) are optional. |
+   | `secrets/bridge.env` | `DISCORD_BOT_TOKEN` and `DISCORD_CHANNEL_IDS` (step 4). The limits under [Using it](#using-it) are optional. |
    | `secrets/shared.env` | `OPENCODE_SERVER_PASSWORD`, any long random string, such as the output of `openssl rand -hex 32` |
 
-3. **Discord bot:** see [Discord bot](#discord-bot).
+   Without `openssl`, as in PowerShell on Windows, this makes one:
 
-4. **Start it:** run `./start.sh`. In `./start.sh --logs`, look for `slash commands ready: ...` and `working in #...` for each enabled channel.
+   ```powershell
+   $b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); -join ($b | ForEach-Object { $_.ToString('x2') })
+   ```
+
+4. **Discord bot:** see [Discord bot](#discord-bot).
+
+5. **Start it:** run `./start.sh`, or `.\start.ps1` in PowerShell on Windows. In the logs (`--logs`, or `-Logs`), look for `slash commands ready: ...` and `working in #...` for each enabled channel.
 
 ### Discord bot
 
@@ -60,6 +73,8 @@ The bridge and the proxy each read only their own file in `secrets/`, so neither
 ./start.sh --logs     # follow the logs
 ./start.sh --stop     # stop the containers (volumes are kept)
 ```
+
+On Windows, `.\start.ps1` does the same, with `-Status`, `-Logs` and `-Stop`. If PowerShell says running scripts is disabled, run `powershell -ExecutionPolicy Bypass -File .\start.ps1` instead.
 
 ## Using it
 
@@ -107,23 +122,3 @@ Used in an enabled channel rather than a thread, `/model`, `/effort` and `/agent
 ## Models
 
 The models, the default model and the effort levels come from `opencode-agent/opencode.json`. After editing it, run the start script again and the slash commands offer the new list. The default is `deepseek-flash`, and `deepseek-v4-pro` is also configured.
-
-## Windows
-
-- **Docker Desktop:** use the WSL 2 backend, turn on "Start Docker Desktop when you sign in", and keep "Expose daemon on tcp://localhost:2375 without TLS" off.
-- **Commands:** use `start.ps1` in PowerShell in place of `start.sh`.
-
-  ```powershell
-  Copy-Item -Recurse secrets.example secrets
-  .\start.ps1           # build and (re)start everything
-  .\start.ps1 -Status   # container state, and which commit each container runs
-  .\start.ps1 -Logs     # follow the logs
-  .\start.ps1 -Stop     # stop the containers (volumes are kept)
-  ```
-
-  If scripts are disabled, run `powershell -ExecutionPolicy Bypass -File .\start.ps1` instead.
-- **Password:** without `openssl`, this makes one for `shared.env`:
-
-  ```powershell
-  $b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); -join ($b | ForEach-Object { $_.ToString('x2') })
-  ```

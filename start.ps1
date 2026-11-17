@@ -33,6 +33,22 @@ function Get-Revision {
 & docker info --format '{{.ServerVersion}}' *> $null
 if ($LASTEXITCODE -ne 0) { throw 'Docker Desktop is not running. Start it and try again.' }
 
+# True when $version (such as 28.0.1 or v2.33.1) is $want or later.
+function Test-AtLeast($version, [version]$want) {
+    if ("$version" -match '^v?(\d+)\.(\d+)(?:\.(\d+))?') {
+        $patch = if ($Matches[3]) { $Matches[3] } else { 0 }
+        return [version]"$($Matches[1]).$($Matches[2]).$patch" -ge $want
+    }
+    return $false
+}
+# compose.yaml sets the agent's gateway with gw_priority, which needs these.
+$engine = & docker version --format '{{.Server.Version}}' 2>$null
+$composeVersion = & docker compose version --short 2>$null
+if (-not (Test-AtLeast $engine '28.0.0') -or -not (Test-AtLeast $composeVersion '2.33.1')) {
+    $found = "Engine $(if ($engine) { $engine } else { '(none)' }) and Compose $(if ($composeVersion) { $composeVersion } else { '(none)' })"
+    throw "opencord needs Docker Engine 28 or later and Compose 2.33.1 or later, not $found. Update Docker Desktop and try again."
+}
+
 if ($Status) {
     $ids = Invoke-Compose ps -a -q
     if (-not $ids) { Write-Host 'No containers. Run .\start.ps1 to deploy.'; exit }
@@ -57,7 +73,7 @@ if ($Stop) { Invoke-Compose stop; exit }
 # Check secrets before deploying.
 $required = @{
     'secrets\proxy.env'  = @('DEEPSEEK_API_KEY')
-    'secrets\bridge.env' = @('DISCORD_BOT_TOKEN')
+    'secrets\bridge.env' = @('DISCORD_BOT_TOKEN', 'DISCORD_CHANNEL_IDS')
     'secrets\shared.env' = @('OPENCODE_SERVER_PASSWORD')
 }
 foreach ($file in $required.Keys) {

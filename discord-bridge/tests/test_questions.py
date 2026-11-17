@@ -102,7 +102,7 @@ def test_custom_ids_round_trip_and_reject_strangers():
 def test_question_text_in_its_three_states():
     assert question_text(LETTER) == "❓ **Which letter?**\n- **A**: Choose letter A\n- **B**: Choose letter B"
     assert question_text(TOPPINGS) == "❓ **Which toppings?**\n-# You can pick more than one."
-    assert question_text(LETTER, answer=["B"], by="Erich") == "❓ **Which letter?**\n**Answer:** B (from Erich)"
+    assert question_text(LETTER, answer=["B"], by="Sam") == "❓ **Which letter?**\n**Answer:** B (from Sam)"
     assert question_text(LETTER, note=GONE) == f"❓ **Which letter?**\n-# {GONE}"
     assert "\\*\\*bold\\*\\*" in question_text({"question": "Is **bold** ok?", "options": []})
 
@@ -220,9 +220,9 @@ def test_typing_an_answer_goes_through_a_pop_up(tmp_path):
         (modal,) = click.response.modals
         assert isinstance(modal, AnswerModal) and modal.title == "Letter" and h.agent.replies == []
 
-        submit = Interaction(THREAD, custom_id="unused", user="erich")
+        submit = Interaction(THREAD, custom_id="unused", user="sam")
         await h.questions.answer_typed(submit, "que_1", 0, "  neither, use C  ")
-        assert submit.response.edited == [("❓ **Which letter?**\n**Answer:** neither, use C (from Erich)", None)]
+        assert submit.response.edited == [("❓ **Which letter?**\n**Answer:** neither, use C (from Sam)", None)]
         assert h.agent.replies == [("que_1", [["neither, use C"]])]
 
         late = Interaction(THREAD, custom_id="unused", message_text=None)
@@ -232,7 +232,7 @@ def test_typing_an_answer_goes_through_a_pop_up(tmp_path):
     asyncio.run(run())
 
 
-def message(text, author="erich"):
+def message(text, author="sam"):
     return types.SimpleNamespace(channel=None, author=types.SimpleNamespace(display_name=author.title(), name=author), content=text)
 
 
@@ -243,7 +243,7 @@ def test_a_plain_message_answers_the_one_open_question(tmp_path):
     sent.channel = h.channel
     assert asyncio.run(h.questions.answer_from_message(sent, "b")) is True
     assert h.agent.replies == [("que_1", [["B"]])]  # matched to the option, whatever the case
-    assert h.channel.text_of(9001) == "❓ **Which letter?**\n**Answer:** B (from Erich)"
+    assert h.channel.text_of(9001) == "❓ **Which letter?**\n**Answer:** B (from Sam)"
     assert h.channel.edits[-1][2] is None  # buttons removed
 
     asyncio.run(h.questions.ask(SESSION, request("que_2")))

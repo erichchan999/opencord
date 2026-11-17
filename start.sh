@@ -31,7 +31,24 @@ revision() {
 }
 
 if ! docker info >/dev/null 2>&1; then
-    echo "Docker is not running. Start it and try again." >&2
+    echo "Docker is not running, or this user can't use it. Start it and try again." >&2
+    exit 1
+fi
+
+# at_least VERSION X Y Z: true when VERSION (such as 28.0.1 or v2.33.1) is
+# X.Y.Z or later.
+at_least() {
+    echo "$1" | sed 's/^v//' | awk -F. -v want="$2 $3 $4" '{
+        split(want, w, " ")
+        if ($1 !~ /^[0-9]+$/) exit 1
+        for (i = 1; i <= 3; i++) if ($i + 0 != w[i]) exit !($i + 0 > w[i])
+    }'
+}
+# compose.yaml sets the agent's gateway with gw_priority, which needs these.
+engine="$(docker version --format '{{.Server.Version}}' 2>/dev/null)" || engine=""
+compose_version="$(docker compose version --short 2>/dev/null)" || compose_version=""
+if ! at_least "$engine" 28 0 0 || ! at_least "$compose_version" 2 33 1; then
+    echo "opencord needs Docker Engine 28 or later and Compose 2.33.1 or later, not Engine ${engine:-(none)} and Compose ${compose_version:-(none)}. Update Docker and try again." >&2
     exit 1
 fi
 
@@ -89,7 +106,7 @@ check() {
     done
 }
 check secrets/proxy.env DEEPSEEK_API_KEY
-check secrets/bridge.env DISCORD_BOT_TOKEN
+check secrets/bridge.env DISCORD_BOT_TOKEN DISCORD_CHANNEL_IDS
 check secrets/shared.env OPENCODE_SERVER_PASSWORD
 
 # compose.yaml puts this on every container as the "opencord.revision" label. A new

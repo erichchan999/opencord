@@ -501,7 +501,7 @@ def test_live_messages_leave_out_what_undo_took_back():
 
 
 def test_asked_separates_the_person_from_their_words():
-    assert commands.asked(request("msg_1", "fix it\nplease", who="Erich")) == ("Erich", "fix it\nplease")
+    assert commands.asked(request("msg_1", "fix it\nplease", who="Sam")) == ("Sam", "fix it\nplease")
     command = {"info": {"role": "user"}, "parts": [{"type": "subtask", "command": "review", "description": "review"}]}
     assert commands.asked(command) == (None, "/review")
     plain = {"info": {"role": "user"}, "parts": [{"type": "text", "text": "From the TUI"}]}

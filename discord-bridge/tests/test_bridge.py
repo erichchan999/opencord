@@ -23,7 +23,7 @@ THREAD = 600  # a thread the bridge opened in it
 STRANGER = 650  # a thread in it the bridge did not open
 ELSEWHERE = 999  # a channel that is not enabled
 BOT_ID = 1234
-AUTHOR = types.SimpleNamespace(name="erich", display_name="Erich", id=42, bot=False)
+AUTHOR = types.SimpleNamespace(name="sam", display_name="Sam", id=42, bot=False)
 
 
 class Agent:
@@ -151,7 +151,7 @@ def test_a_request_from_prompt_to_reply(world):
 
     ((sent_to, body),) = world.agent.prompts
     assert sent_to == session == world.entry["sessionId"]
-    assert body["parts"] == [{"type": "text", "text": "Discord user Erich says:\n\ndo the thing"}]
+    assert body["parts"] == [{"type": "text", "text": "Discord user Sam says:\n\ndo the thing"}]
     assert body["model"] == {"providerID": "deepseek-proxy", "modelID": "deepseek-flash"}
     assert body["tools"] == {"question": True} and "variant" not in body and "agent" not in body
 
@@ -681,7 +681,7 @@ def test_an_empty_mention_opens_a_thread_to_set_up_first(server):
     message = Message(Channel(CHANNEL), "")
     asyncio.run(bridge.on_message(message))
     (thread,) = message.threads
-    assert thread.name == "New thread by Erich" and message.replies == []
+    assert thread.name == "New thread by Sam" and message.replies == []
     entry = bridge.store.threads["700"]
     assert entry["sessionId"] is None and entry["placeholderName"] is True and entry["effort"] == "max"
     assert bridge.queue.submitted == [] and server.agent.created == []
@@ -704,7 +704,7 @@ def first_message(server, text):
 def test_the_first_request_in_an_empty_thread_names_it_and_its_session(server):
     session = play(server, "tools")
     server.entry.update(placeholderName=True, effort="max")  # chosen while the thread was empty
-    server.thread.name = "New thread by Erich"
+    server.thread.name = "New thread by Sam"
     first_message(server, "Fix the login bug\nIt fails on Safari.")
     assert server.thread.name == "Fix the login bug"
     assert server.agent.created == ["Discord: Fix the login bug"] and server.agent.renamed == []
@@ -724,10 +724,10 @@ def test_an_empty_thread_whose_session_exists_already_renames_it_too(server):
 def test_a_failed_rename_does_not_stop_the_first_request(server):
     play(server, "tools")
     server.entry["placeholderName"] = True
-    server.thread.name = "New thread by Erich"
+    server.thread.name = "New thread by Sam"
     server.thread.fail_edit = discord.HTTPException(types.SimpleNamespace(status=429, reason="slow down"), "rate limited")
     first_message(server, "Fix the login bug")
-    assert server.thread.name == "New thread by Erich" and server.agent.created == ["Discord: Fix the login bug"]
+    assert server.thread.name == "New thread by Sam" and server.agent.created == ["Discord: Fix the login bug"]
     assert len(server.agent.prompts) == 1 and "placeholderName" not in server.entry
 
 
@@ -937,7 +937,7 @@ def test_files_go_out_with_the_prompt(world):
     assert body["parts"] == [
         {
             "type": "text",
-            "text": "Discord user Erich says:\n\n(No message, only the attached files.)\n\n"
+            "text": "Discord user Sam says:\n\n(No message, only the attached files.)\n\n"
             "(Attached to this message, with their content included here: a.txt. They are not in the sandbox.)",
         },
         part,
