@@ -12,7 +12,7 @@
   PROMPT_TIMEOUT_SECONDS, shows no activity for PROMPT_SILENCE_SECONDS, or
   leaves a question unanswered for QUESTION_TIMEOUT_SECONDS.
 - Slash commands (commands.py) choose a thread's model, thinking effort and
-  agent, and control its session: undo, fork, diff, shell commands, the
+  agent, and control its session: undo, fork, shell commands, the
   agent's own commands and more. The bridge keeps the settings (state.py) and
   sends them with every prompt.
 - Text files attached to a message are sent to the agent as their content.

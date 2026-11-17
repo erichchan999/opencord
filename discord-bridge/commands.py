@@ -20,16 +20,15 @@ import io
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, Callable
 
 import discord
 from discord import app_commands
 
 from catalog import DEFAULT_WORD, model_key
-from events import is_request, parts_text, request_text, tool_detail
+from events import is_request, parts_text, request_text
 from state import SETTINGS, set_setting, settings_of
-from status import MESSAGE_LIMIT, format_duration, format_tokens, plain, plural, todo_lines
+from status import MESSAGE_LIMIT, format_duration, format_tokens, plain, plural
 
 log = logging.getLogger("bridge")
 
@@ -177,99 +176,6 @@ def file_names(changes, limit=10):
     return ", ".join(names) + more
 
 
-def build_diff(sections):
-    """(text of a .diff file, {file: [lines added, lines removed]}).
-
-    `sections` holds (request number, what was asked, its file changes) for
-    each request in order. Each request's patches get a heading line.
-    """
-    out, totals = [], {}
-    for number, text, changes in sections:
-        if not changes:
-            continue
-        out.append(f"# Request {number}: {plain(text, 200)}")
-        for change in changes:
-            patch = (change.get("patch") or "").rstrip("\n")
-            if patch:
-                out.append(patch)
-            counts = totals.setdefault(change.get("file") or "?", [0, 0])
-            counts[0] += change.get("additions") or 0
-            counts[1] += change.get("deletions") or 0
-        out.append("")
-    return "\n".join(out), totals
-
-
-def diff_summary(totals, limit=15):
-    added = sum(a for a, _ in totals.values())
-    removed = sum(r for _, r in totals.values())
-    lines = [f"**{plural(len(totals), 'file')} changed** in this session (+{added} −{removed}):"]
-    for name, (a, r) in list(totals.items())[:limit]:
-        lines.append(f"`{plain(name, 80)}` +{a} −{r}")
-    if len(totals) > limit:
-        lines.append(f"… and {len(totals) - limit} more")
-    return "\n".join(lines)
-
-
-def stamp(milliseconds):
-    if not milliseconds:
-        return ""
-    return datetime.fromtimestamp(milliseconds / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-
-def transcript(messages, title, session_id, undone=0, now=None):
-    """The conversation as Markdown: each request, then what the agent said and which tools it used."""
-    now = now or datetime.now(timezone.utc)
-    lines = [f"# {title}", "", f"OpenCode session `{session_id}`, exported {now:%Y-%m-%d %H:%M} UTC."]
-
-    def block(*new):
-        """Adds lines as a paragraph of their own: one blank line before them."""
-        if lines and lines[-1] != "":
-            lines.append("")
-        lines.extend(new)
-
-    answered = True
-    for message in messages:
-        info = message.get("info") or {}
-        parts = message.get("parts") or []
-        if info.get("role") == "user":
-            if not is_request(message):
-                continue  # the agent's notes to itself
-            who, text = asked(message)
-            created = stamp((info.get("time") or {}).get("created"))
-            block(f"## {who or 'Request'}" + (f" · {created}" if created else ""))
-            block(text.strip() or "(no text)")
-            files = [part.get("filename") or "file" for part in parts if part.get("type") == "file"]
-            if files:
-                block("Attached: " + ", ".join(f"`{name}`" for name in files))
-            answered = False
-        elif info.get("role") == "assistant":
-            for part in parts:
-                kind = part.get("type")
-                text = (part.get("text") or "").strip()
-                shown = kind == "tool" or (kind == "text" and text and not part.get("synthetic") and not part.get("ignored"))
-                if not shown:
-                    continue
-                if not answered:
-                    block("### Agent")
-                    answered = True
-                if kind == "tool":
-                    tool = part.get("tool") or "tool"
-                    line = f"- `{tool}` {tool_detail(tool, part.get('state') or {})}".rstrip()
-                    if lines[-1].startswith("- `"):
-                        lines.append(line)  # tool calls in a row form one list
-                    else:
-                        block(line)
-                else:
-                    block(text)
-            error = info.get("error")
-            if error:
-                detail = (error.get("data") or {}).get("message") or ""
-                block(f"> ⚠️ {error.get('name') or 'error'}{': ' + detail if detail else ''}")
-    if undone:
-        block(f"_{plural(undone, 'later message')} taken back with /undo {'is' if undone == 1 else 'are'} left out._")
-    return "\n".join(lines).strip() + "\n"
-
-
 def shell_result(message):
     """(output, error) of a /shell run, from the message the agent stored for it."""
     for part in (message or {}).get("parts") or []:
@@ -327,17 +233,6 @@ def confirm_view(message_id):
 def fork_name(name):
     base = re.sub(r" \(fork(?: \d+)?\)$", "", name or "thread")
     return f"{base[:90]} (fork)"
-
-
-async def gather_limited(calls, limit=4):
-    """Runs the calls (functions returning awaitables) with at most `limit` at a time, results in order."""
-    gate = asyncio.Semaphore(limit)
-
-    async def one(call):
-        async with gate:
-            return await call()
-
-    return await asyncio.gather(*(one(call) for call in calls))
 
 
 def setup(tree, ctx):
@@ -576,69 +471,6 @@ def setup(tree, ctx):
                 lines.append("**Session:** none yet. One starts with the next message.")
         await interaction.followup.send("\n".join(lines), ephemeral=True, allowed_mentions=NO_MENTIONS)
 
-    @tree.command(name="todo", description="Show the agent's todo list for this thread.")
-    @app_commands.guild_only()
-    async def todo(interaction: discord.Interaction):
-        entry = await thread_entry(interaction)
-        if entry is None:
-            return
-        if not entry.get("sessionId"):
-            return await refuse(interaction, "The agent has no todo list here yet.")
-        await interaction.response.defer(ephemeral=True)
-        todos = await ctx.agent.todos(entry["sessionId"], entry["directory"])
-        if not todos:
-            text = "The agent has no todo list in this session."
-        else:
-            finished = sum(1 for item in todos if item.get("status") == "completed")
-            text = f"**Todo list** · {finished} of {len(todos)} done\n" + "\n".join(todo_lines(todos, limit=None))
-        await interaction.followup.send(text[:MESSAGE_LIMIT], ephemeral=True, allowed_mentions=NO_MENTIONS)
-
-    @tree.command(name="diff", description="Post the file changes this thread's session made, as a .diff file.")
-    @app_commands.guild_only()
-    async def diff(interaction: discord.Interaction):
-        entry = await thread_entry(interaction)
-        if entry is None:
-            return
-        if not entry.get("sessionId"):
-            return await refuse(interaction, "This thread hasn't changed any files yet.")
-        await interaction.response.defer()
-        note(interaction, "diff")
-        session_id, directory = entry["sessionId"], entry["directory"]
-        session, messages = await session_and_messages(entry)
-        requests = [m for m in live_messages(messages, session)[0] if is_request(m)]
-        # The agent reports changes one request at a time.
-        changes = await gather_limited(
-            [lambda m=m: ctx.agent.diff(session_id, directory, m["info"]["id"]) for m in requests]
-        )
-        sections = [(number, asked(m)[1], found or []) for number, (m, found) in enumerate(zip(requests, changes), 1)]
-        text, totals = build_diff(sections)
-        if not totals:
-            return await interaction.followup.send("This session hasn't changed any files.", allowed_mentions=NO_MENTIONS)
-        await interaction.followup.send(
-            diff_summary(totals), file=file_of(text.encode(), "changes.diff"), allowed_mentions=NO_MENTIONS
-        )
-
-    @tree.command(name="export", description="Post this thread's conversation with the agent as a Markdown file.")
-    @app_commands.guild_only()
-    async def export(interaction: discord.Interaction):
-        entry = await thread_entry(interaction)
-        if entry is None:
-            return
-        if not entry.get("sessionId"):
-            return await refuse(interaction, "There is nothing to export yet.")
-        await interaction.response.defer()
-        note(interaction, "export")
-        session, messages = await session_and_messages(entry)
-        live, undone = live_messages(messages, session)
-        title = getattr(channel_of(interaction), "name", None) or (session or {}).get("title") or "Conversation"
-        text = transcript(live, title, entry["sessionId"], undone)
-        count = sum(1 for m in live if is_request(m))
-        await interaction.followup.send(
-            f"This thread's conversation so far: {plural(count, 'request')}.",
-            file=file_of(text.encode(), "conversation.md"),
-            allowed_mentions=NO_MENTIONS,
-        )
-
     @tree.command(name="help", description="List what I can do and the commands I understand.")
     @app_commands.guild_only()
     async def help_(interaction: discord.Interaction):
@@ -655,9 +487,6 @@ def setup(tree, ctx):
             "`/agent` switch between agents such as `build` and `plan`\n"
             "**Looking**\n"
             "`/status` the thread's settings and how full its context is\n"
-            "`/todo` the agent's todo list\n"
-            "`/diff` the files this thread changed, as a `.diff` file\n"
-            "`/export` the whole conversation as a Markdown file\n"
             "**The session**\n"
             "`/stop` stop the current request and drop waiting ones (`!stop` does the same)\n"
             "`/undo` take back the last request and its file changes, `/redo` bring it back\n"

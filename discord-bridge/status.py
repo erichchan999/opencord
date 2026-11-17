@@ -47,9 +47,9 @@ def plural(count, word):
 
 
 def todo_lines(todos, limit=TODO_LINES):
-    """One line per todo. Past `limit` lines (None: no limit), finished ones are folded into a count."""
+    """One line per todo. Past `limit` lines, finished ones are folded into a count."""
     lines = [f"{TODO_MARKS.get(todo.get('status'), '⬜')} {plain(todo.get('content', ''))}" for todo in todos]
-    if limit is None or len(lines) <= limit:
+    if len(lines) <= limit:
         return lines
     # Too many to show: fold the finished ones into a count and list what is left.
     finished = sum(1 for todo in todos if todo.get("status") in ("completed", "cancelled"))

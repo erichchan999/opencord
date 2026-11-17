@@ -133,9 +133,6 @@ class OpenCode:
         """Every message of the session, oldest first."""
         return await self.request("GET", f"/session/{session_id}/message", directory=directory, timeout=30) or []
 
-    async def todos(self, session_id, directory):
-        return await self.request("GET", f"/session/{session_id}/todo", directory=directory, timeout=10) or []
-
     async def delete_session(self, session_id, directory):
         await self.request("DELETE", f"/session/{session_id}", directory=directory, timeout=30)
 

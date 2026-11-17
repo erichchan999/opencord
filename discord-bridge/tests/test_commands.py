@@ -1,7 +1,6 @@
 """Runs the slash command handlers against stand-ins for Discord and the agent."""
 
 import asyncio
-from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
@@ -43,7 +42,6 @@ class Agent:
         self.summarized = []
         self.history = []  # the session's messages
         self.info = {"id": "ses_1", "title": "Discord: Fix the login bug"}  # GET /session/{id}
-        self.todo_list = []
         self.changes = {}  # request message id -> file changes
         self.calls = []
         self.shell_answer = None
@@ -60,9 +58,6 @@ class Agent:
 
     async def summarize(self, session_id, directory, model, timeout):
         self.summarized.append((session_id, model))
-
-    async def todos(self, session_id, directory):
-        return self.todo_list
 
     async def diff(self, session_id, directory, message_id):
         return self.changes.get(message_id, [])
@@ -190,23 +185,21 @@ def only_reply(interaction):
     return interaction.response.sent[0]
 
 
-def request(message_id, text, who="Tester", created=1763380800000):
+def request(message_id, text, who="Tester"):
     """A prompt the bridge forwarded, as the agent stores it."""
     return {
-        "info": {"id": message_id, "role": "user", "time": {"created": created}},
+        "info": {"id": message_id, "role": "user"},
         "parts": [{"type": "text", "text": f"Discord user {who} says:\n\n{text}"}],
     }
 
 
-def reply(message_id, text="", tools=()):
-    parts = [{"type": "tool", "tool": tool, "state": {"status": "completed", "input": given}} for tool, given in tools]
-    if text:
-        parts.append({"type": "text", "text": text})
+def reply(message_id, text=""):
+    parts = [{"type": "text", "text": text}] if text else []
     return {"info": {"id": message_id, "role": "assistant"}, "parts": parts}
 
 
 ALL_COMMANDS = {
-    "model", "effort", "agent", "status", "help", "stop", "clear", "compact", "todo", "diff", "export",
+    "model", "effort", "agent", "status", "help", "stop", "clear", "compact",
     "undo", "redo", "fork", "rename", "shell", "command",
 }
 
@@ -271,7 +264,7 @@ def test_unknown_model_is_refused_privately_and_changes_nothing(tmp_path):
 
 
 THREAD_COMMANDS = [
-    ("stop", {}), ("clear", {}), ("compact", {}), ("todo", {}), ("diff", {}), ("export", {}), ("undo", {}),
+    ("stop", {}), ("clear", {}), ("compact", {}), ("undo", {}),
     ("redo", {}), ("fork", {}), ("rename", {"name": "x"}), ("shell", {"command": "ls"}),
     ("command", {"name": "review"}),
 ]
@@ -515,84 +508,6 @@ def test_asked_separates_the_person_from_their_words():
     assert commands.asked(command) == (None, "/review")
     plain = {"info": {"role": "user"}, "parts": [{"type": "text", "text": "From the TUI"}]}
     assert commands.asked(plain) == (None, "From the TUI")
-
-
-def test_build_diff_keeps_each_requests_patches_under_a_heading():
-    patch_a = "Index: a.txt\n===\n--- a.txt\n+++ a.txt\n@@ -1 +1,2 @@\n one\n+two\n"
-    patch_b = "Index: b.txt\n===\n--- b.txt\n+++ b.txt\n@@ -0,0 +1 @@\n+new\n"
-    text, totals = commands.build_diff(
-        [
-            (1, "add two", [{"file": "a.txt", "patch": patch_a, "additions": 1, "deletions": 0}]),
-            (2, "just asking", []),
-            (3, "more", [{"file": "a.txt", "patch": patch_a, "additions": 2, "deletions": 1}, {"file": "b.txt", "patch": patch_b, "additions": 1, "deletions": 0}]),
-        ]
-    )
-    assert text.startswith("# Request 1: add two\nIndex: a.txt")
-    assert "# Request 2" not in text and "# Request 3: more\n" in text
-    assert totals == {"a.txt": [3, 1], "b.txt": [1, 0]}
-    assert commands.diff_summary(totals) == "**2 files changed** in this session (+4 −1):\n`a.txt` +3 −1\n`b.txt` +1 −0"
-
-
-def test_transcript_shows_requests_replies_and_tools():
-    history = [
-        request("msg_1", "list the files", who="Erich"),
-        reply("msg_2", tools=[("bash", {"command": "ls -la"})]),
-        {"info": {"id": "msg_3", "role": "user"}, "parts": [{"type": "text", "text": "Summarize the task", "synthetic": True}]},
-        reply("msg_4", "Two files.\n\n- a\n- b"),
-        {"info": {"id": "msg_5", "role": "assistant", "error": {"name": "APIError", "data": {"message": "rate limited"}}}, "parts": []},
-    ]
-    text = commands.transcript(history, "Files", "ses_1", undone=2, now=datetime(2026, 11, 17, 9, 30, tzinfo=timezone.utc))
-    assert text.startswith("# Files\n\nOpenCode session `ses_1`, exported 2026-11-17 09:30 UTC.")
-    assert "## Erich · 2025-11-17 12:00 UTC\n\nlist the files" in text
-    assert text.count("### Agent") == 1 and "### Agent\n\n- `bash` ls -la\n\nTwo files." in text
-    assert "Summarize the task" not in text
-    assert "Two files.\n\n- a\n- b\n\n> ⚠️ APIError: rate limited" in text
-    assert text.endswith("_2 later messages taken back with /undo are left out._\n")
-    assert "\n\n\n" not in text
-
-
-def test_todo_lists_every_item_privately(tmp_path):
-    h = Harness(tmp_path)
-    text, private = only_reply(h.run("todo"))
-    assert private and "no todo list" in text
-
-    h.entry["sessionId"] = "ses_1"
-    assert "no todo list in this session" in h.run("todo").followup.sent[0][0]
-
-    h.agent.todo_list = [{"content": f"step {n}", "status": "completed" if n < 4 else "pending"} for n in range(12)]
-    interaction = h.run("todo")
-    text, private = interaction.followup.sent[0]
-    assert interaction.response.deferred is True and private
-    assert text.startswith("**Todo list** · 4 of 12 done\n") and "✅ step 0" in text and "⬜ step 11" in text
-
-
-def test_diff_posts_the_sessions_changes_as_a_file(tmp_path):
-    h = Harness(tmp_path)
-    h.entry["sessionId"] = "ses_1"
-    h.agent.history = [request("msg_1", "edit a"), reply("msg_2", "ok"), request("msg_3", "undone"), reply("msg_4", "ok")]
-    patch = "--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n-x\n+y\n"
-    h.agent.changes = {"msg_1": [{"file": "a.txt", "patch": patch, "additions": 1, "deletions": 1}], "msg_3": [{"file": "z.txt", "patch": "zzz"}]}
-    h.agent.info["revert"] = {"messageID": "msg_3"}  # the second request was undone
-    interaction = h.run("diff")
-    assert interaction.response.deferred is False
-    assert interaction.followup.sent == [("**1 file changed** in this session (+1 −1):\n`a.txt` +1 −1", False)]
-    ((name, data),) = interaction.followup.files
-    assert name == "changes.diff" and data.decode() == f"# Request 1: edit a\n{patch.rstrip()}\n"
-
-    h.agent.changes = {}
-    assert h.run("diff").followup.sent == [("This session hasn't changed any files.", False)]
-
-
-def test_export_posts_the_conversation_as_markdown(tmp_path):
-    h = Harness(tmp_path)
-    assert only_reply(h.run("export"))[1] is True  # nothing yet
-    h.entry["sessionId"] = "ses_1"
-    h.agent.history = [request("msg_1", "hello"), reply("msg_2", "Hi there.")]
-    interaction = h.run("export")
-    assert interaction.followup.sent == [("This thread's conversation so far: 1 request.", False)]
-    ((name, data),) = interaction.followup.files
-    text = data.decode()
-    assert name == "conversation.md" and text.startswith("# Fix the login bug\n") and "Hi there." in text
 
 
 def test_rename_renames_the_thread_and_its_session(tmp_path):

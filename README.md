@@ -103,9 +103,6 @@ A request is stopped, and the thread told, when it hits one of these limits, set
 | `/effort` | Choose how hard the model thinks: `off`, `low`, `high` or `max` |
 | `/agent` | Choose the OpenCode agent: `build` (the default) or `plan`, which proposes without editing files |
 | `/status` | Show the thread's settings, whether it is working and how full the context is |
-| `/todo` | Show the agent's todo list |
-| `/diff` | Post the session's file changes as a `.diff` file |
-| `/export` | Post the conversation as a Markdown file |
 | `/stop` | Same as `!stop` |
 | `/undo` | Take back the last request and its file changes, after asking. Changes other threads made to those files since are lost too. |
 | `/redo` | Bring back what `/undo` took back, until the next message |
