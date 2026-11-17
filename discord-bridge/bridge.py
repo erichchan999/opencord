@@ -8,8 +8,9 @@
   channel are ignored.
 - Threads run in parallel, up to MAX_CONCURRENT at once.
 - "!stop" in a thread aborts the running request and drops that thread's
-  queued ones. A request that runs longer than PROMPT_TIMEOUT_SECONDS (30 min)
-  is aborted too, freeing its slot.
+  queued ones. A request is also stopped when it works longer than
+  PROMPT_TIMEOUT_SECONDS, shows no activity for PROMPT_SILENCE_SECONDS, or
+  leaves a question unanswered for QUESTION_TIMEOUT_SECONDS.
 - Slash commands (commands.py) choose a thread's model, thinking effort and
   agent, and control its session: undo, fork, diff, shell commands, the
   agent's own commands and more. The bridge keeps the settings (state.py) and
@@ -23,8 +24,9 @@
 - A request that was running when the bridge stopped is picked back up when it
   starts again.
 
-This container holds the Discord bot token. It never runs user commands; it
-only forwards text to the agent's HTTP API and posts the replies back.
+This container holds the Discord bot token. It runs nothing itself: prompts,
+/shell and the other session commands go to the agent's HTTP API, and the
+bridge posts what comes back.
 """
 
 import asyncio
@@ -926,8 +928,7 @@ async def on_ready():
         log.info("slash commands ready: %s", " ".join(f"/{command.name}" for command in synced))
     except discord.Forbidden as err:
         log.error(
-            "could not register slash commands: %s. Re-invite the bot with the applications.commands scope "
-            "(see the README).",
+            "could not register slash commands: %s. Re-invite the bot with the invite link in the README.",
             err,
         )
     except discord.HTTPException as err:

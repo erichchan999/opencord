@@ -92,4 +92,4 @@ networks:
 volumes:
   work: {}         # the shared repo clone all sessions work in
   agent-data: {}   # OpenCode sessions
-  bridge-data: {}  # Discord thread -> session map
+  bridge-data: {}  # the bridge's thread map, per-thread settings and open questions

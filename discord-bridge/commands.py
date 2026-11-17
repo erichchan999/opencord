@@ -7,9 +7,9 @@ and /agent used in the main channel set what new threads start with.
 A change is answered publicly, so everyone in the thread sees it. Lookups and
 refusals are shown only to the person who ran the command.
 
-Commands that work on the session (/compact, /fork, /shell, /command and the
-undo button) are queued like messages, so they never run in the middle of a
-request.
+Commands that work on the session (/compact, /fork, /shell, /command, /redo
+and the undo button) are queued like messages, so they never run in the middle
+of a request.
 """
 
 import asyncio

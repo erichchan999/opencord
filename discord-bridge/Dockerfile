@@ -18,8 +18,8 @@ RUN python -m pytest -q tests
 
 FROM base
 
-# State (thread -> session map) lives on a volume owned by the app user.
-# UID 1000 matches the owner of the existing bridge-data volume.
+# State (thread map, settings, open questions) lives on the bridge-data volume,
+# owned by the app user. The UID stays 1000 so it keeps owning the files there.
 RUN useradd --uid 1000 --no-create-home --shell /usr/sbin/nologin bridge \
  && mkdir -p /data && chown bridge:bridge /data
 
