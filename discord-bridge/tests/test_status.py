@@ -129,9 +129,10 @@ def test_a_deleted_status_message_is_posted_again():
         status = StatusMessage(channel)
         await status.show("one")
         channel.deleted.add(9001)
-        await status.show("two")  # the edit fails: the message is gone
-        await status.show("two")
+        await status.show("two")  # the edit fails: the message is gone, so it is posted again at once
         assert channel.texts() == ["one", "two"] and status.message_id == 9002
+        await status.show("two")
+        assert channel.texts() == ["one", "two"]
 
     asyncio.run(run())
 

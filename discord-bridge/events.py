@@ -280,7 +280,7 @@ async def follow(agent, directory, router, on_connected):
         except asyncio.CancelledError:
             raise
         except Exception as err:
-            log.warning("event stream dropped: %s", err or type(err).__name__)
+            log.warning("event stream dropped: %s", str(err) or type(err).__name__)
         await asyncio.sleep(delay)
         delay = min(delay * 2, 15)
 

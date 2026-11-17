@@ -68,24 +68,36 @@ def env(name, default=None):
     return value
 
 
+def number(name, default, kind=float):
+    """A number from the environment. Left blank, it is the default."""
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return default
+    try:
+        return kind(value)
+    except ValueError:
+        log.error("%s must be a number, not %r", name, value)
+        sys.exit(1)
+
+
 TOKEN = env("DISCORD_BOT_TOKEN")
 OPENCODE_URL = env("OPENCODE_URL", "http://opencode-agent:4096")
 OPENCODE_PASSWORD = env("OPENCODE_SERVER_PASSWORD")
 STATE_FILE = os.environ.get("STATE_FILE", "/data/threads.json")
 BASE_DIR = os.environ.get("BASE_DIR", "/work/repo")
 CHANNEL_IDS = set(map(str.strip, os.environ.get("DISCORD_CHANNEL_IDS", "").split(","))) - {""}
-MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "16"))
+MAX_CONCURRENT = number("MAX_CONCURRENT", 16, int)
 # Longest a request may work, not counting time spent waiting for a person to
 # answer a question.
-PROMPT_TIMEOUT = float(os.environ.get("PROMPT_TIMEOUT_SECONDS", "1800"))
+PROMPT_TIMEOUT = number("PROMPT_TIMEOUT_SECONDS", 1800)
 # A request is stopped when the agent shows no activity at all for this long.
-SILENCE_TIMEOUT = float(os.environ.get("PROMPT_SILENCE_SECONDS", "900"))
+SILENCE_TIMEOUT = number("PROMPT_SILENCE_SECONDS", 900)
 # A request is stopped when a question from the agent goes unanswered this long.
-QUESTION_TIMEOUT = float(os.environ.get("QUESTION_TIMEOUT_SECONDS", "3600"))
+QUESTION_TIMEOUT = number("QUESTION_TIMEOUT_SECONDS", 3600)
 # Longest wait for /compact, which is one model call over the whole conversation.
 COMPACT_TIMEOUT = 300
 # Longest a /shell command may run.
-SHELL_TIMEOUT = float(os.environ.get("SHELL_TIMEOUT_SECONDS", "600"))
+SHELL_TIMEOUT = number("SHELL_TIMEOUT_SECONDS", 600)
 # Text files attached to a message are sent to the agent as their content, up
 # to this size each and the second size for all of a message's files together,
 # which keeps them well inside the model's context. Files past either limit,
@@ -115,13 +127,15 @@ class ThreadQueue:
         self._locks = {}
         self._pending = Counter()
         self._dropped_before = {}  # thread id -> jobs submitted before this number are skipped
+        self._running = {}  # thread id -> number of the job that has started
         self._seq = itertools.count()
         self._tasks = set()  # asyncio only keeps weak references to tasks
 
-    def submit(self, thread_id, job):
+    def submit(self, thread_id, job, droppable=True):
+        """Queues `job` for the thread. A job that is not droppable runs even after a stop."""
         lock = self._locks.setdefault(thread_id, asyncio.Lock())
         self._pending[thread_id] += 1
-        task = asyncio.create_task(self._run(thread_id, lock, job, next(self._seq)))
+        task = asyncio.create_task(self._run(thread_id, lock, job, next(self._seq), droppable))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
@@ -138,13 +152,27 @@ class ThreadQueue:
         if self._pending[thread_id]:
             self._dropped_before[thread_id] = max(stop_point, self._dropped_before.get(thread_id, -1))
 
-    async def _run(self, thread_id, lock, job, seq):
+    def stopped(self, thread_id):
+        """True when the thread's started job was submitted before a stop point given to drop_waiting.
+
+        A job that has started is not dropped, so one that is still getting
+        ready (waiting for a slot, reading attachments) checks this before it
+        sends anything.
+        """
+        running = self._running.get(thread_id)
+        return running is not None and running < self._dropped_before.get(thread_id, -1)
+
+    async def _run(self, thread_id, lock, job, seq, droppable):
         try:
             async with lock:
-                if seq < self._dropped_before.get(thread_id, -1):
+                if droppable and seq < self._dropped_before.get(thread_id, -1):
                     return
-                async with self._slots:
-                    await job()
+                self._running[thread_id] = seq
+                try:
+                    async with self._slots:
+                        await job()
+                finally:
+                    del self._running[thread_id]
         except Exception:
             log.exception("thread %s", thread_id)
         finally:
@@ -161,36 +189,40 @@ queue = ThreadQueue(MAX_CONCURRENT)
 
 
 def split_for_discord(text):
-    """Splits a reply into messages under Discord's limit, keeping code fences intact."""
-    chunks = []
-    current = ""
-    in_fence = False
+    """Splits a reply into messages under Discord's limit, keeping code blocks intact.
 
-    def push():
-        nonlocal current
-        if not current.strip():
-            return
-        chunks.append(current + "\n```" if in_fence else current)
-        current = "```\n" if in_fence else ""
+    A code block cut in two is closed at the end of one message and opened
+    again, with its language, at the start of the next. A line longer than a
+    message is cut into pieces.
+    """
+    piece_size = DISCORD_LIMIT - 50  # leaves room for the fence lines around a piece
+    chunks, lines, size = [], [], 0
+    opener = None  # the line that opened the code block we are in, or None
+
+    def body():
+        # A code block that opens on the chunk's last line has nothing in it
+        # yet, so it moves to the next message whole.
+        return lines[:-1] if opener is not None and lines[-1:] == [opener] else lines
+
+    def flush():
+        nonlocal lines, size
+        kept = body()
+        if any(line.strip() for line in kept):
+            chunks.append("\n".join(kept + (["```"] if kept is lines and opener is not None else [])))
+        lines = [opener] if opener is not None else []
+        size = sum(len(line) + 1 for line in lines)
 
     for line in text.split("\n"):
-        # Checked before a long line is cut, so its tail can't hide the fence.
-        fence = line.lstrip().startswith("```")
-        while len(line) > DISCORD_LIMIT:
-            push()
-            current += line[:DISCORD_LIMIT]
-            line = line[DISCORD_LIMIT:]
-            if fence:
-                in_fence = not in_fence
-                fence = False
-            push()
-        if len(current) + len(line) + 1 > DISCORD_LIMIT:
-            push()
-        current += line if not current or current.endswith("\n") else "\n" + line
-        if fence:
-            in_fence = not in_fence
-    if current.strip():
-        chunks.append(current)
+        for start in range(0, max(len(line), 1), piece_size):
+            piece = line[start : start + piece_size]
+            if size + len(piece) + 5 > DISCORD_LIMIT:  # 5: a newline and a closing fence
+                flush()
+            lines.append(piece)
+            size += len(piece) + 1
+        if line.lstrip().startswith("```"):
+            opener = None if opener is not None else (line if len(line) <= piece_size else "```")
+    if any(line.strip() for line in body()):
+        chunks.append("\n".join(body()))
     return chunks
 
 
@@ -369,16 +401,39 @@ async def thread_for_session(session_id):
     return None
 
 
+def note_clock(entry, turn):
+    """Adds how long the turn has worked to its note, so a restarted bridge
+    leaves out the time spent waiting on people. True if there was a note."""
+    note = entry.get("turn")
+    if note is not None:
+        note.update(worked=turn.running_for(), paused=turn.waiting, notedAt=time.time())
+    return note is not None
+
+
+def worked_before(note):
+    """Seconds a request from before a restart had worked, from its note."""
+    now = time.time()
+    if not isinstance(note.get("worked"), (int, float)):
+        return max(0.0, now - (note.get("startedAt") or now))
+    # While it was waiting on a person its clock was stopped, downtime included.
+    since = 0.0 if note.get("paused") else now - (note.get("notedAt") or now)
+    return max(0.0, note["worked"] + since)
+
+
 def question_opened(thread_id):
     turn = router.turn_for_thread(thread_id)
     if turn is not None:
         turn.pause()  # the request's clock stops while a person is being waited on
+        if note_clock(store.threads.get(str(thread_id)) or {}, turn):
+            store.save()
 
 
 def question_closed(thread_id):
     turn = router.turn_for_thread(thread_id)
     if turn is not None:
         turn.resume()
+        if note_clock(store.threads.get(str(thread_id)) or {}, turn):
+            store.save()
 
 
 questions = Questions(
@@ -504,6 +559,9 @@ async def run_turn(thread, entry, author, text, files=()):
         "tools": {"question": True},
         **options,
     }
+    if queue.stopped(thread.id):  # stopped while it got ready, before there was a turn to mark
+        log.info("thread %s: stopped before the prompt went out", thread.id)
+        return
     # Registered before the prompt goes out, so none of its events are missed.
     turn = router.start(entry["sessionId"], thread.id)
     try:
@@ -516,6 +574,10 @@ async def run_turn(thread, entry, author, text, files=()):
             await replace_session(thread, entry)
             turn = router.start(entry["sessionId"], thread.id)
             await agent.prompt_async(entry["sessionId"], entry["directory"], body)
+        if turn.stopped:
+            # Stopped while the prompt was on its way, so the abort may have reached the agent first.
+            with contextlib.suppress(Exception):
+                await agent.abort(turn.session_id, entry["directory"])
         await follow_turn(thread, entry, turn, label, time.time())
     finally:
         router.finish(turn)
@@ -529,9 +591,11 @@ def command_ended(turn, call):
     if err is None:
         turn.done.set()
         return
-    # The agent may still be working (the connection dropped, say). The waiter
-    # asks the agent, and ends the turn with this error if it is not.
-    if turn.error is None:
+    # The agent may still be working (the connection dropped, or the call
+    # outlasted its timeout while a question waited). The waiter asks the
+    # agent. Only a call that failed before the work began is the request's
+    # error: once it has begun, the agent's own messages say how it went.
+    if turn.error is None and not turn.active:
         turn.error = (type(err).__name__, str(err))
     turn.wake.set()
 
@@ -548,6 +612,9 @@ async def run_command(thread, entry, name, arguments):
         body["variant"] = options["variant"]
     if "agent" in options:
         body["agent"] = options["agent"]
+    if queue.stopped(thread.id):
+        log.info("thread %s: stopped before /%s went out", thread.id, name)
+        return
     turn = router.start(session_id, thread.id)
     # The command call only returns when the work is done. Its result is the reply.
     call = asyncio.create_task(agent.command(session_id, entry["directory"], body, PROMPT_TIMEOUT + SILENCE_TIMEOUT))
@@ -570,7 +637,10 @@ async def resume_turn(thread_id, entry):
         return
     started_at = info.get("startedAt") or time.time()
     # Registered before asking the agent, so the end of the work is not missed in between.
-    turn = router.start(session_id, int(thread_id), active=True, elapsed=max(0.0, time.time() - started_at))
+    turn = router.start(session_id, int(thread_id), active=True, elapsed=worked_before(info))
+    # Counted before anything waits: a question shown from then on pauses the turn itself.
+    for _ in questions.open_for(thread_id):
+        turn.pause()
     try:
         working = session_id in await agent.statuses(entry["directory"])
         log.info(
@@ -579,8 +649,6 @@ async def resume_turn(thread_id, entry):
         )
         if not working:
             turn.done.set()
-        for _ in questions.open_for(thread_id):
-            turn.pause()
         await follow_turn(
             channel_for(thread_id), entry, turn, info.get("label") or "", started_at, info.get("statusMessageId")
         )
@@ -607,6 +675,7 @@ async def follow_turn(thread, entry, turn, label, started_at, status_message_id=
         await status.show(render())
         # Kept while the turn runs. A bridge that restarts reads it to pick the request back up.
         entry["turn"] = {"statusMessageId": status.message_id, "startedAt": started_at, "label": label}
+        note_clock(entry, turn)
         store.save()
         updater = asyncio.create_task(status.follow(turn, render))
         try:

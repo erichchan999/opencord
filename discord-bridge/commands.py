@@ -716,8 +716,9 @@ def setup(tree, ctx):
                     log.warning("thread %s: could not delete session %s: %s", interaction.channel_id, old, err)
 
             # Queued, so a stopped request finishes writing up its outcome
-            # before its session goes. Not skipped for a disabled channel.
-            ctx.queue.submit(interaction.channel_id, delete_old)
+            # before its session goes. Not skipped for a disabled channel, and
+            # not dropped by a later stop.
+            ctx.queue.submit(interaction.channel_id, delete_old, droppable=False)
         await interaction.followup.send(
             "Cleared this thread's context. Its settings are kept, and the next message starts from scratch.",
             allowed_mentions=NO_MENTIONS,
@@ -757,11 +758,11 @@ def setup(tree, ctx):
             finally:
                 typing.cancel()
 
-        waiting = ctx.queue.load(interaction.channel_id)
         note(interaction, "compact")
+        waiting = queued(interaction)
         # Queued like a message, so it never runs in the middle of a request.
         enqueue(interaction, job)
-        await say(interaction, "Compacting this thread's conversation" + (" after the current request." if waiting else "."))
+        await say(interaction, f"Compacting this thread's conversation{waiting}.")
 
     # ------------------------------------------------------------ undo and redo
 

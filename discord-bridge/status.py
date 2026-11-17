@@ -125,17 +125,19 @@ class StatusMessage:
         if text == self._shown:
             return
         try:
-            if self.message_id is None:
-                message = await self._channel.send(text, allowed_mentions=NO_MENTIONS, suppress_embeds=True)
-                self.message_id = message.id
-            else:
-                # Embeds stay suppressed: that flag was set when the message was sent.
-                await self._channel.get_partial_message(self.message_id).edit(
-                    content=text, allowed_mentions=NO_MENTIONS
-                )
+            if self.message_id is not None:
+                try:
+                    # Embeds stay suppressed: that flag was set when the message was sent.
+                    await self._channel.get_partial_message(self.message_id).edit(
+                        content=text, allowed_mentions=NO_MENTIONS
+                    )
+                    self._shown = text
+                    return
+                except discord.NotFound:
+                    self.message_id = None  # someone deleted it: post a new one
+            message = await self._channel.send(text, allowed_mentions=NO_MENTIONS, suppress_embeds=True)
+            self.message_id = message.id
             self._shown = text
-        except discord.NotFound:
-            self.message_id = None  # someone deleted it: the next update posts a new one
         except discord.HTTPException as err:
             log.warning("could not update the status message: %s", err)
 

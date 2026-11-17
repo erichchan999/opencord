@@ -224,13 +224,16 @@ class Questions:
 
     async def reconcile(self):
         """Brings the threads in line with what the agent is waiting on, after the stream was away."""
+        # Taken before asking: the stream keeps showing and answering questions
+        # meanwhile, and only those already shown can be judged by the answer.
+        known = set(self._store.questions)
         pending = await self._agent.pending_questions(self._directory)
         working = await self._agent.statuses(self._directory)
         pending_ids = {request.get("id") for request in pending}
-        for request_id in [rid for rid in self._store.questions if rid not in pending_ids]:
+        for request_id in known - pending_ids:
             await self._retire(request_id, GONE)
         for request in pending:
-            if request.get("id") in self._store.questions:
+            if request.get("id") in known or request.get("id") in self._store.questions:
                 continue
             thread_id = await self._thread_for_session(request.get("sessionID"))
             if thread_id is None:

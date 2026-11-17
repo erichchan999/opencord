@@ -324,6 +324,24 @@ def test_after_the_stream_was_away_threads_match_what_the_agent_waits_on(tmp_pat
     assert h.agent.rejected == []
 
 
+def test_questions_shown_or_answered_while_checking_are_left_alone(tmp_path):
+    h = Harness(tmp_path)
+    asyncio.run(h.questions.ask(SESSION, request("que_answered_now")))
+    h.agent.pending = [request("que_answered_now")]
+
+    async def statuses(directory):
+        # The stream keeps going while the bridge asks: one is asked, the other answered.
+        await h.questions.ask(SESSION, request("que_asked_now"))
+        await h.questions.on_component(Interaction(THREAD, custom_id=custom_id("que_answered_now", 0, "o", 0)))
+        return h.agent.working
+
+    h.agent.statuses = statuses
+    sent = len(h.channel.sent)
+    asyncio.run(h.questions.reconcile())
+    assert h.questions.open_for(THREAD) == ["que_asked_now"]  # not taken for one the agent stopped waiting on
+    assert len(h.channel.sent) == sent + 1  # the answered one is not shown again
+
+
 def test_a_question_left_by_a_request_that_ended_is_dismissed_not_shown(tmp_path):
     h = Harness(tmp_path)
     h.agent.pending = [request("que_stale")]

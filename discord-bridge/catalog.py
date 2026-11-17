@@ -143,6 +143,7 @@ class Catalog:
         self._snapshot = None
         self._fetched_at = 0.0
         self._refreshing = None
+        self._first = None  # the fetch under way while there is no snapshot yet
 
     async def _commands(self):
         # Only /command uses this list, so a failure here must not cost every
@@ -185,7 +186,14 @@ class Catalog:
 
     async def get(self):
         if self._snapshot is None:
-            return await self._fetch()
+            # Callers that arrive while it is under way share one fetch. A
+            # failed one is dropped, so the next call tries again.
+            first = self._first = self._first or asyncio.create_task(self._fetch())
+            try:
+                return await asyncio.shield(first)
+            finally:
+                if first.done() and self._first is first:
+                    self._first = None
         if time.monotonic() - self._fetched_at > self._ttl and self._refreshing is None:
             self._refreshing = asyncio.create_task(self._refresh())
         return self._snapshot

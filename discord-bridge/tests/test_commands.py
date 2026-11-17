@@ -29,7 +29,7 @@ class Queue:
     def stop_point(self):
         return 7
 
-    def submit(self, thread_id, job):
+    def submit(self, thread_id, job, droppable=True):
         self.jobs.append((thread_id, job))
 
     def run_all(self):

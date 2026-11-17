@@ -103,6 +103,20 @@ def test_catalog_reads_once_then_serves_from_memory():
     asyncio.run(run())
 
 
+def test_callers_waiting_on_the_first_read_share_it_and_a_failed_one_is_tried_again():
+    async def run():
+        agent = FakeAgent()
+        catalog = Catalog(agent, "/work/repo", ttl=60)
+        agent.fail = True
+        results = await asyncio.gather(catalog.get(), catalog.get(), catalog.get(), return_exceptions=True)
+        assert all(isinstance(result, OSError) for result in results) and agent.calls == 1
+        agent.fail = False
+        first, second = await asyncio.gather(catalog.get(), catalog.get())
+        assert first is second and agent.calls == 2
+
+    asyncio.run(run())
+
+
 def test_stale_catalog_answers_at_once_and_refreshes_behind():
     async def run():
         agent = FakeAgent()

@@ -273,6 +273,46 @@ def test_after_a_restart_a_request_still_running_is_followed_to_its_end(world):
     asyncio.run(run())
 
 
+def test_after_a_restart_time_spent_waiting_on_people_still_does_not_count(world):
+    async def run():
+        session = note_from_before(world, "tools", seconds_ago=3000)
+        world.agent.working = {session: {"type": "busy"}}
+        # It had worked a minute, then waited on a question until the bridge stopped.
+        world.entry["turn"].update(worked=60, paused=True, notedAt=time.time() - 2000)
+        bridge.store.questions["que_1"] = {"thread": str(THREAD), "questions": [{"question": "Which?"}], "answers": [None], "messages": [77], "askedAt": time.time() - 2900}
+        task = asyncio.create_task(bridge.resume_turn(str(THREAD), world.entry))
+        await asyncio.sleep(0.05)
+        turn = bridge.router.turn_for_thread(THREAD)
+        assert turn.waiting and 59 < turn.running_for() < 62
+        await bridge.questions.closed("que_1")
+        assert not turn.waiting and world.entry["turn"]["paused"] is False
+        bridge.router.dispatch(event("session.idle", session))
+        await asyncio.wait_for(task, 2)
+        assert world.thread.text_of(4242).startswith("-# ✅ Done in 1m 0")
+
+    asyncio.run(run())
+
+
+def test_after_a_restart_a_question_shown_while_checking_is_waited_on_once(world):
+    async def run():
+        session = note_from_before(world, "tools")
+
+        async def statuses(directory):
+            await bridge.questions.ask(session, {"id": "que_1", "sessionID": session, "questions": [{"question": "Which?"}]})
+            return {session: {"type": "busy"}}
+
+        world.agent.statuses = statuses
+        task = asyncio.create_task(bridge.resume_turn(str(THREAD), world.entry))
+        await asyncio.sleep(0.05)
+        turn = bridge.router.turn_for_thread(THREAD)
+        await bridge.questions.closed("que_1")
+        assert not turn.waiting
+        bridge.router.dispatch(event("session.idle", session))
+        await asyncio.wait_for(task, 2)
+
+    asyncio.run(run())
+
+
 def test_a_note_without_a_session_is_just_dropped(world):
     world.entry["turn"] = {"statusMessageId": 4242, "startedAt": time.time(), "label": ""}
     asyncio.run(bridge.resume_turn(str(THREAD), world.entry))
@@ -292,6 +332,68 @@ def test_stopping_a_thread_marks_the_request_and_dismisses_its_questions(world):
         bridge.router.finish(turn)
 
     asyncio.run(run())
+
+
+def test_a_stop_while_a_request_gets_ready_keeps_its_prompt_from_going_out(world, monkeypatch):
+    monkeypatch.setattr(bridge, "queue", bridge.ThreadQueue(4))
+
+    async def run():
+        ready = asyncio.Event()
+
+        async def job():
+            await ready.wait()  # downloading its attachments, say
+            await bridge.run_turn(world.thread, world.entry, AUTHOR, "never mind")
+
+        bridge.queue.submit(THREAD, job)
+        await asyncio.sleep(0)
+        await bridge.stop_thread(THREAD, world.entry, bridge.queue.stop_point())
+        ready.set()
+        while bridge.queue.load(THREAD):
+            await asyncio.sleep(0.01)
+
+    asyncio.run(asyncio.wait_for(run(), 2))
+    assert world.agent.prompts == [] and world.thread.sent == [] and bridge.router.turns == {}
+
+
+def test_a_stop_drops_waiting_jobs_but_not_ones_that_must_run():
+    async def run():
+        queue, ran, gate = bridge.ThreadQueue(4), [], asyncio.Event()
+
+        async def blocker():
+            await gate.wait()
+
+        def job(name):
+            async def run_it():
+                ran.append(name)
+
+            return run_it
+
+        queue.submit(THREAD, blocker)
+        queue.submit(THREAD, job("message"))
+        queue.submit(THREAD, job("delete old session"), droppable=False)
+        queue.drop_waiting(THREAD, queue.stop_point())
+        gate.set()
+        while queue.load(THREAD):
+            await asyncio.sleep(0.01)
+        assert ran == ["delete old session"]
+
+    asyncio.run(asyncio.wait_for(run(), 2))
+
+
+def test_a_stop_that_beats_the_prompt_to_the_agent_is_sent_again(world):
+    session = world.agent.session_id
+    world.agent.stream = [event("session.status", session, status={"type": "busy"})]
+    world.agent.on_abort = lambda: bridge.router.dispatch(event("session.idle", session))
+    prompt = world.agent.prompt_async
+
+    async def stopped_on_the_way(session_id, directory, body):
+        bridge.router.turn_for_thread(THREAD).stopped = True  # what stop_thread does meanwhile
+        await prompt(session_id, directory, body)
+
+    world.agent.prompt_async = stopped_on_the_way
+    asyncio.run(asyncio.wait_for(bridge.run_turn(world.thread, world.entry, AUTHOR, "stop me"), 2))
+    assert world.agent.aborted == [session]
+    assert world.thread.text_of(world.thread.sent[0][0]).startswith("-# 🛑 Stopped after ")
 
 
 def test_a_question_stops_the_requests_clock_until_it_is_answered(world):
@@ -455,6 +557,38 @@ def test_a_command_the_agent_refuses_reports_the_error_and_not_an_older_reply(wo
     assert world.thread.texts()[1:] == ["The agent stopped with an error: POST /session/ses_new/command -> 500: boom"]
 
 
+def test_a_command_whose_call_times_out_after_the_work_began_still_reports_the_reply(world):
+    session = world.agent.session_id
+    world.agent.stream = [
+        event("session.status", session, status={"type": "busy"}),
+        event("message.updated", session, info={"id": "msg_u", "role": "user"}),
+    ]
+    world.agent.working = {session: {"type": "busy"}}
+    world.agent.messages = [
+        {"info": {"id": "msg_u", "role": "user"}, "parts": [{"type": "text", "text": "/review"}]},
+        {"info": {"id": "msg_a", "role": "assistant"}, "parts": [{"type": "text", "text": "Reviewed after all."}]},
+    ]
+
+    async def command(session_id, directory, body, timeout):
+        for item in world.agent.stream:
+            bridge.router.dispatch(item)
+        # A question kept the work going past the call's own deadline.
+        raise TimeoutError(f"POST /session/{session_id}/command timed out after 2700s")
+
+    world.agent.command = command
+
+    async def run():
+        task = asyncio.create_task(bridge.run_command(world.thread, world.entry, "review", ""))
+        await asyncio.sleep(0.05)
+        world.agent.working = {}
+        bridge.router.dispatch(event("session.idle", session))
+        await asyncio.wait_for(task, 2)
+
+    asyncio.run(run())
+    assert world.thread.text_of(world.thread.sent[0][0]).startswith("-# ✅ Done in ")
+    assert world.thread.texts()[1:] == ["Reviewed after all."]
+
+
 # ---------------------------------------------------------------- attachments
 
 
@@ -529,3 +663,33 @@ def test_files_go_out_with_the_prompt(world):
         },
         part,
     ]
+
+
+# ---------------------------------------------------------------- settings and replies
+
+
+def test_a_blank_number_setting_means_its_default(monkeypatch):
+    monkeypatch.setenv("PROMPT_TIMEOUT_SECONDS", " ")
+    assert bridge.number("PROMPT_TIMEOUT_SECONDS", 1800) == 1800
+    monkeypatch.setenv("MAX_CONCURRENT", "4")
+    assert bridge.number("MAX_CONCURRENT", 16, int) == 4
+    monkeypatch.setenv("MAX_CONCURRENT", "lots")
+    with pytest.raises(SystemExit):
+        bridge.number("MAX_CONCURRENT", 16, int)
+
+
+def test_a_long_reply_is_split_with_its_code_blocks_intact():
+    limit = bridge.DISCORD_LIMIT
+    text = "Here it is:\n```json\n" + "x" * (2 * limit + 100) + "\n```\nThat's all."
+    chunks = bridge.split_for_discord(text)
+    assert all(len(chunk) <= limit + 20 for chunk in chunks)
+    assert all(chunk.count("```") % 2 == 0 for chunk in chunks)  # every code block is closed
+    assert not any(chunk.replace("```json", "").replace("```", "").strip() == "" for chunk in chunks)
+    assert "".join(chunks).count("x") == 2 * limit + 100
+    assert chunks[0].startswith("Here it is:\n```json\nxxx") and chunks[-1].endswith("```\nThat's all.")
+    assert all(chunk.startswith("```json\n") for chunk in chunks[1:])  # reopened with its language
+
+    # A code block that would open on a message's last line moves to the next one whole.
+    text = "a" * (limit - 100) + "\n```py\n" + "b" * 500 + "\n```"
+    assert bridge.split_for_discord(text) == ["a" * (limit - 100), "```py\n" + "b" * 500 + "\n```"]
+    assert bridge.split_for_discord("short\n\n```\ncode\n```") == ["short\n\n```\ncode\n```"]
